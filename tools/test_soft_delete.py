@@ -1,0 +1,10 @@
+import requests
+r=requests.post('http://127.0.0.1:8000/api/dispatches',json={'deal_id':1,'vehicle_number':'SOFT-TEST','dispatch_date':'2026-03-23','qty_mt':1.0,'plant_id':1})
+print('create', r.status_code, r.text)
+resp=r.json()
+id=resp.get('id')
+r=requests.delete(f'http://127.0.0.1:8000/api/dispatches/{id}')
+print('delete', r.status_code, r.text)
+r2=requests.get('http://127.0.0.1:8000/api/audit-logs')
+print('audit count', len(r2.json()))
+print('latest', r2.json()[0])

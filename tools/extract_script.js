@@ -1,0 +1,1 @@
+const fs=require('fs'); const data=fs.readFileSync('index.html','utf8'); const m=data.match(/<script[^>]*>([\s\S]*?)<\/script>/i); if(!m){ console.error('no script'); process.exit(1);} fs.writeFileSync('tools/frontend.js', m[1], 'utf8'); console.log('wrote tools/frontend.js');

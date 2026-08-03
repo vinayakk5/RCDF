@@ -1,0 +1,19 @@
+{
+  "name": "rcdf-whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "100% Free Self-Hosted WhatsApp Web Multi-Device Bridge for RCDF Platform",
+  "main": "bridge.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.13",
+    "axios": "^1.7.9",
+    "express": "^4.21.2",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.34.7"
+  }
+}

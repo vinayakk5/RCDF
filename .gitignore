@@ -1,0 +1,75 @@
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ── Environment & Secrets ───────────────────────────────────────────────────
+.env
+*.env
+backend/.env
+backend/glowing-indexer-*.json
+
+# ── Database files ──────────────────────────────────────────────────────────
+database/*.db
+database/*.sqlite
+database/*.sqlite3
+*.db
+*.sqlite
+
+# ── Node / WhatsApp Bridge ──────────────────────────────────────────────────
+backend/whatsapp_bridge/node_modules/
+backend/whatsapp_bridge/auth_wweb_session/
+backend/whatsapp_bridge/auth_test/
+backend/whatsapp_bridge/.wwebjs_cache/
+backend/whatsapp_bridge/.wwebjs_auth/
+
+# ── Uploads (user media - never commit) ────────────────────────────────────
+backend/uploads/
+uploads/
+
+# ── Temp / scratch / exports ────────────────────────────────────────────────
+scratch/
+backend/busy_exports/
+backend/__pycache__/
+backend/services/__pycache__/
+backend/db_migrations/__pycache__/
+*.log
+*.tmp
+backend/.tmp_sync_all_mail.py
+
+# ── IDE / OS ────────────────────────────────────────────────────────────────
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Build artifacts ─────────────────────────────────────────────────────────
+*.exe
+*.out
+*.o
+tempCodeRunnerFile.*
+test.cpp
+test.exe
+
+# ── Excel / misc project files not needed on server ────────────────────────
+*.xlsx
+*.xls
+*.jpeg
+*.jpg
+*.png
+Book1.xlsx
+File1.xls
+"WhatsApp Image*"
