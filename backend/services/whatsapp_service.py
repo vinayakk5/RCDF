@@ -54,11 +54,12 @@ async def handle_whatsapp_webhook(payload: dict, db: Session) -> Dict[str, Any]:
     file_path = media.get("path") if isinstance(media, dict) else payload.get("file_path")
     mime_type = media.get("mimetype") if isinstance(media, dict) else payload.get("mime_type")
     
-    has_media = False
+    payload_has_media = bool(payload.get("has_media") or payload.get("media") or file_path)
+    has_media = payload_has_media
+    
     if file_path:
         file_path = os.path.normpath(file_path)
         if os.path.exists(file_path):
-            has_media = True
             log.info(f"[WhatsApp] Media file confirmed at: {file_path}")
         else:
             backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -67,14 +68,15 @@ async def handle_whatsapp_webhook(payload: dict, db: Session) -> Dict[str, Any]:
                 os.path.join(backend_dir, "whatsapp_bridge", "uploads", os.path.basename(file_path)),
                 os.path.join(backend_dir, file_path),
             ]
+            found = False
             for candidate in candidates:
                 if os.path.exists(candidate):
                     file_path = candidate
-                    has_media = True
                     log.info(f"[WhatsApp] Media file resolved to: {file_path}")
+                    found = True
                     break
-            if not has_media:
-                log.warning(f"[WhatsApp] Media file NOT FOUND at: {file_path} — tried: {candidates}")
+            if not found:
+                log.warning(f"[WhatsApp] Media file NOT FOUND on disk at: {file_path} — tried: {candidates}, but keeping has_media=True")
 
     # Check WhatsApp Config for whitelist and auto-reply
     config = db.execute(select(WhatsAppConfig).order_by(WhatsAppConfig.id.desc())).scalar_one_or_none()

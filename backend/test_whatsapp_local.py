@@ -66,8 +66,18 @@ def test_local_whatsapp_pipeline():
             db.refresh(broker)
         print(f"✅ Broker context: ID={broker.id}, Name={broker.name}")
 
+        # Ensure WhatsAppConfig has whitelisted JID or empty whitelist
+        config = db.query(WhatsAppConfig).first()
+        if not config:
+            config = WhatsAppConfig(is_enabled=True, auto_reply=True, whitelisted_jids=["1203630283921829@g.us", "919876543210@s.whatsapp.net"])
+            db.add(config)
+        else:
+            config.is_enabled = True
+            config.whitelisted_jids = ["1203630283921829@g.us", "919876543210@s.whatsapp.net"]
+        db.commit()
+
         # 3. Simulate Incoming WhatsApp Purchase Bill Message
-        print("\n[Step 3] Simulating Incoming WhatsApp Webhook (Structured Purchase Bill)...")
+        print("\n[Step 3] Simulating Incoming WhatsApp Webhook (Media Purchase Bill)...")
         sample_msg_id = f"TEST_WA_MSG_{int(datetime.now().timestamp())}"
         test_payload = {
             "message_id": sample_msg_id,
@@ -77,8 +87,14 @@ def test_local_whatsapp_pipeline():
             "sender_jid": "919876543210@s.whatsapp.net",
             "sender_name": "Apex Agri Traders",
             "sender_phone": "919876543210",
-            "media_type": "text",
-            "text": "Purchase Bill: Maize 240 Qtl @ Rs 2150 Truck RJ14GC5522 from Apex Agri Traders to Jaipur Plant",
+            "has_media": True,
+            "media": {
+                "filename": "sample_bill.jpg",
+                "path": "uploads/whatsapp/sample_bill.jpg",
+                "mimetype": "image/jpeg",
+                "filesize": 12345
+            },
+            "text": "",
             "caption": ""
         }
 
