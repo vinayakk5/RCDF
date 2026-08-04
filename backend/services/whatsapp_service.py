@@ -119,20 +119,47 @@ async def handle_whatsapp_webhook(payload: dict, db: Session) -> Dict[str, Any]:
 
     try:
         if has_media:
-            log.info(f"[WhatsApp] Media received: {file_path} (mime={mime_type}). Queuing for background OCR.")
-            # Skip synchronous OCR to mimic email flow
-            doc_type = "unclassified"
-            doc_enum = DocumentType.not_classified
-            status = "pending"
+            log.info(f"[WhatsApp] Media received: {file_path} (mime={mime_type}). Processing OCR synchronously.")
+            from services.ocr_service import classify_document_type, extract_document_by_type
             
-            party = sender_name or "Partner"
-            
-            reply_text = (
-                f"✅ *RCDF Operations: Document Received*\n\n"
-                f"📄 *File:* {os.path.basename(file_path) if file_path else 'Attached Media'}\n"
-                f"👤 *Sender:* {party}\n\n"
-                f"Status: Queued in Operations Ingest Hub for OCR & classification."
-            )
+            try:
+                # 1. Classify
+                file_name = os.path.basename(file_path) if file_path else "unknown"
+                doc_type_str, conf, cands = classify_document_type(file_path, file_name)
+                
+                doc_type = doc_type_str
+                try:
+                    doc_enum = DocumentType[doc_type]
+                except KeyError:
+                    doc_enum = getattr(DocumentType, doc_type, DocumentType.not_classified)
+                    
+                status = "pending"
+                
+                # 2. Extract
+                extracted_data = await extract_document_by_type(file_path, doc_type)
+                ocr_result = extracted_data
+                
+                party = sender_name or "Partner"
+                
+                reply_text = (
+                    f"✅ *RCDF Operations: Document Received & Extracted*\n\n"
+                    f"📄 *File:* {file_name}\n"
+                    f"🏷️ *Type:* {doc_type.replace('_', ' ').title()}\n"
+                    f"👤 *Sender:* {party}\n\n"
+                    f"Status: Queued in Ingest Hub. Ready for your review."
+                )
+            except Exception as e:
+                log.error(f"[WhatsApp] Synchronous OCR failed: {e}", exc_info=True)
+                doc_type = "unclassified"
+                doc_enum = DocumentType.not_classified
+                status = "pending"
+                party = sender_name or "Partner"
+                reply_text = (
+                    f"✅ *RCDF Operations: Document Received*\n\n"
+                    f"📄 *File:* {os.path.basename(file_path) if file_path else 'Attached Media'}\n"
+                    f"👤 *Sender:* {party}\n\n"
+                    f"Status: Queued in Operations Ingest Hub for OCR & classification."
+                )
 
         elif text:
             # Handle structured text message (e.g., 'Maize 300 Qtl @ 2150 RJ14GC1234')
@@ -203,8 +230,8 @@ async def handle_whatsapp_webhook(payload: dict, db: Session) -> Dict[str, Any]:
                 file_name=file_name,
                 file_path=file_path or "",
                 document_type=doc_enum,
-                classifier_confidence=0.9 if has_media else 0.5,
-                classifier_candidates=[{"type": doc_type, "score": 0.9}],
+                classifier_confidence=conf if has_media and 'conf' in locals() else (0.9 if has_media else 0.5),
+                classifier_candidates=cands if has_media and 'cands' in locals() else [{"type": doc_type, "score": 0.9}],
                 extracted_payload=extracted_data or {},
                 unclear_fields=extracted_data.get("unclear_fields") or [],
                 status=IngestStatus.pending,

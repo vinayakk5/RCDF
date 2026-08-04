@@ -3710,6 +3710,8 @@ def _pending_ingest_to_dict(p: PendingIngest) -> dict:
 
 
 def _pending_abs_path(file_path: str) -> Path:
+    if not file_path:
+        return Path(".")
     p = Path(file_path)
     if p.is_absolute() and p.exists():
         return p

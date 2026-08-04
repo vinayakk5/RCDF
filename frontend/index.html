@@ -6787,6 +6787,8 @@ pages.whatsapp = {
             this.render();
             toast('WhatsApp Connected Successfully!', 'ok');
           }
+        } else if (!s.connected && s.status === 'qr_ready') {
+          this.fetchQR();
         }
       } catch {}
     }, 4000);
