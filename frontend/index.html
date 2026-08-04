@@ -3177,13 +3177,14 @@ pages.bills = {
           </div>
           <div style="padding:12px;background:var(--bg);display:flex;justify-content:center">
             ${(() => {
-              const p = b.image_path ? b.image_path.split('/').pop() : null;
-              if (!p) return this.mockBillHtml(b);
-              const lower = p.toLowerCase();
-              if (lower.endsWith('.pdf')) {
-                return `<div style="display:flex;flex-direction:column;align-items:center;gap:8px"><a href="/uploads/bills/${p}" target="_blank" style="text-decoration:none;color:var(--primary)">📄 View PDF</a><span style="font-size:12px;color:var(--muted)">Open in new tab to view</span></div>`;
+              if (!b.image_path) return this.mockBillHtml(b);
+              const norm = b.image_path.replace(/\\/g, '/');
+              const idx = norm.indexOf('uploads/');
+              const url = idx !== -1 ? '/' + norm.substring(idx) : `/uploads/bills/${norm.split('/').pop()}`;
+              if (url.toLowerCase().endsWith('.pdf')) {
+                return `<div style="display:flex;flex-direction:column;align-items:center;gap:8px"><a href="${url}" target="_blank" style="text-decoration:none;color:var(--primary)">📄 View PDF</a><span style="font-size:12px;color:var(--muted)">Open in new tab to view</span></div>`;
               }
-              return `<img src="/uploads/bills/${p}" style="max-width:320px;max-height:300px;border-radius:4px" onerror="this.replaceWith(document.createTextNode('Image not found'))">`;
+              return `<img src="${url}" style="max-width:320px;max-height:300px;border-radius:4px" onerror="this.replaceWith(document.createTextNode('Image not found'))">`;
             })()} 
           </div>
         </div>
@@ -7696,8 +7697,14 @@ pages.whatsapp = {
       if (item.media_path.startsWith('http')) {
         mediaUrl = item.media_path;
       } else {
-        const basename = item.media_path.split(/[\\\\/]/).pop();
-        mediaUrl = `/uploads/bills/${basename}`;
+        const normPath = item.media_path.replace(/\\/g, '/');
+        const idx = normPath.indexOf('uploads/');
+        if (idx !== -1) {
+          mediaUrl = '/' + normPath.substring(idx);
+        } else {
+          const basename = normPath.split('/').pop();
+          mediaUrl = `/uploads/whatsapp/${basename}`;
+        }
       }
     }
 
