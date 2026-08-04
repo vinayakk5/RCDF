@@ -117,54 +117,19 @@ async def handle_whatsapp_webhook(payload: dict, db: Session) -> Dict[str, Any]:
 
     try:
         if has_media:
-            log.info(f"[WhatsApp] Starting OCR on media file: {file_path} (mime={mime_type})")
-            from services.ocr_service import extract_bill
-            extracted_data = await extract_bill(file_path)
-            ocr_result = extracted_data
-            log.info(f"[WhatsApp] OCR complete: source={extracted_data.get('source')} high_conf={extracted_data.get('high_confidence')} fields={extracted_data.get('fields_found')} error={extracted_data.get('error')}")
-
-            raw_lower = (extracted_data.get("raw_text") or "").lower()
+            log.info(f"[WhatsApp] Media received: {file_path} (mime={mime_type}). Queuing for background OCR.")
+            # Skip synchronous OCR to mimic email flow
+            doc_type = "unclassified"
+            doc_enum = DocumentType.not_classified
+            status = "pending"
             
-            is_weight_slip = any(kw in raw_lower for kw in [
-                "dharmkanta", "weighbridge", "gross wt", "tare wt", "net wt", "kanta slip", "weight slip"
-            ]) and not extracted_data.get("rate_per_mt")
-
-            is_utr_payment = any(kw in raw_lower for kw in [
-                "utr", "neft", "rtgs", "imps", "transaction id", "payment successful"
-            ]) and any(kw in raw_lower for kw in ["debited", "transferred", "credited", "upi ref"])
-
-            if is_weight_slip:
-                doc_type = "plant_unloading"
-                doc_enum = DocumentType.plant_unloading
-            elif is_utr_payment:
-                doc_type = "payment_proof"
-                doc_enum = DocumentType.not_classified
-            elif extracted_data.get("fields_found", 0) > 0 or extracted_data.get("supplier_name") or extracted_data.get("vendor_name") or extracted_data.get("rate_per_mt") or extracted_data.get("vehicle_number"):
-                doc_type = "purchase_bill"
-                doc_enum = DocumentType.purchase_bill
-            else:
-                doc_type = "unclassified"
-                doc_enum = DocumentType.not_classified
-                status = "flagged"
-
-            party = (extracted_data.get("supplier_name") or extracted_data.get("vendor_name")
-                     or extracted_data.get("broker_name") or sender_name or "Partner")
-            mat = extracted_data.get("material_type") or "Grain/Feed"
-            qty = (extracted_data.get("quantity_mt") or extracted_data.get("quantity_qtl")
-                   or extracted_data.get("net_qty_qtl") or "—")
-            rate = (extracted_data.get("rate_per_mt") or extracted_data.get("rate_per_qtl")
-                    or extracted_data.get("rate") or "—")
-            truck = extracted_data.get("vehicle_number") or "N/A"
-
+            party = sender_name or "Partner"
+            
             reply_text = (
                 f"✅ *RCDF Operations: Document Received*\n\n"
-                f"📄 *Type:* {doc_type.replace('_', ' ').title()}\n"
-                f"👤 *Party:* {party}\n"
-                f"🌾 *Item:* {mat}\n"
-                f"⚖️ *Qty:* {qty} Qtl/MT\n"
-                f"💰 *Rate:* ₹{rate}\n"
-                f"🚛 *Truck:* {truck}\n\n"
-                f"Status: Queued in Operations Ingest Hub for verification."
+                f"📄 *File:* {os.path.basename(file_path) if file_path else 'Attached Media'}\n"
+                f"👤 *Sender:* {party}\n\n"
+                f"Status: Queued in Operations Ingest Hub for OCR & classification."
             )
 
         elif text:
