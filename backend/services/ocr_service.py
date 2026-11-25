@@ -3924,24 +3924,35 @@ async def _extract_with_groq_prompt(file_path: str, prompt_text: str, source_tag
 
         if len(pdf_text.strip()) > 60:
             client = Groq(api_key=api_key)
-            await _sleep_before_llm_request_async()
-            response = client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"{prompt_text}\n\nDocument Text:\n{pdf_text[:9000]}\n\nReturn only one valid JSON object with no extra text.",
-                    }
-                ],
-                model="qwen/qwen3.8-27b",
-                temperature=0.0,
-                response_format={"type": "json_object"},
-            )
-            raw = (response.choices[0].message.content or "").strip()
-            payload = _load_json_object_loose(raw)
-            if isinstance(payload, dict) and payload:
-                payload["source"] = f"{source_tag}_text"
-                payload["high_confidence"] = True
-                return payload
+            groq_models = [m for m in (os.getenv("GROQ_TEXT_MODELS") or "qwen/qwen3.8-27b,openai/gpt-oss-120b").replace(" ", "").split(",") if m]
+            last_err = None
+            for groq_model in groq_models:
+                try:
+                    await _sleep_before_llm_request_async()
+                    response = await asyncio.to_thread(
+                        client.chat.completions.create,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": f"{prompt_text}\n\nDocument Text:\n{pdf_text[:9000]}\n\nReturn only one valid JSON object with no extra text.",
+                            }
+                        ],
+                        model=groq_model,
+                        temperature=0.0,
+                        response_format={"type": "json_object"},
+                    )
+                    raw = (response.choices[0].message.content or "").strip()
+                    payload = _load_json_object_loose(raw)
+                    if isinstance(payload, dict) and payload:
+                        payload["source"] = f"{source_tag}_text"
+                        payload["model"] = groq_model
+                        payload["high_confidence"] = True
+                        return payload
+                except Exception as ge:
+                    last_err = ge
+                    log.warning("Groq text model %s failed: %s", groq_model, str(ge)[:160])
+            if last_err is not None:
+                return {"source": source_tag, "error": str(last_err)[:300], "high_confidence": False}
 
         # Groq currently does not support vision models on free tier
         return {
@@ -4235,7 +4246,35 @@ async def _extract_with_openrouter_prompt(file_path: str, prompt_text: str, sour
                 pass
 
 
-async def _extract_with_gemini_prompt(file_path: str, prompt_text: str, source_tag: str) -> dict:
+GEMINI_PRIMARY_MODELS = [m for m in (os.getenv("GEMINI_BILL_MODELS") or "gemini-2.5-flash,gemini-3.5-flash").replace(" ", "").split(",") if m]
+GEMINI_LITE_MODELS = [m for m in (os.getenv("GEMINI_LITE_BILL_MODELS") or "gemini-3.5-flash-lite,gemini-3.1-flash-lite").replace(" ", "").split(",") if m]
+
+
+def _gemini_retryable(err: str) -> bool:
+    e = (err or "").lower()
+    return any(x in e for x in ("503", "unavailable", "429", "resource_exhausted", "quota", "404", "no longer available", "is not found for api version", "overloaded", "high demand"))
+
+
+async def _extract_with_gemini_prompt(file_path: str, prompt_text: str, source_tag: str, models: Optional[List[str]] = None) -> dict:
+    """Gemini vision extraction, trying each model in turn on quota/overload errors.
+
+    Each Gemini model has its own free-tier quota, so falling back to another model
+    keeps bills flowing when one model is busy.
+    """
+    last = {"source": source_tag, "error": "no gemini model configured", "high_confidence": False}
+    for model in (models or GEMINI_PRIMARY_MODELS):
+        res = await _extract_with_gemini_prompt_one(file_path, prompt_text, source_tag, model)
+        if not res.get("error"):
+            res["model"] = model
+            return res
+        last = res
+        if not _gemini_retryable(str(res.get("error"))):
+            break
+        log.warning("Gemini model %s unavailable (%s); trying next", model, str(res.get("error"))[:120])
+    return last
+
+
+async def _extract_with_gemini_prompt_one(file_path: str, prompt_text: str, source_tag: str, model: str) -> dict:
     from database import get_settings
     settings = get_settings()
     if not settings.gemini_api_key:
@@ -4258,9 +4297,10 @@ async def _extract_with_gemini_prompt(file_path: str, prompt_text: str, source_t
         mime = _mime_type_for_path(gemini_input_path)
         blob = src_gemini.read_bytes()
         await _sleep_before_llm_request_async()
-        text = _gemini_generate_text(
+        text = await asyncio.to_thread(
+            _gemini_generate_text,
             api_key=settings.gemini_api_key,
-            model="gemini-2.5-flash",
+            model=model,
             prompt_text=f"{prompt_text}\n\nReturn only one valid JSON object with no extra text.",
             blob=blob,
             mime=mime,
@@ -4991,18 +5031,21 @@ def _bill_readers(file_path: str) -> dict:
     """Free bill readers by name. Each returns a dict, with "error" on failure."""
     return {
         "gemini": lambda: _extract_with_gemini_prompt(file_path, GEMINI_PROMPT, "gemini_prompt"),
+        "gemini_lite": lambda: _extract_with_gemini_prompt(file_path, GEMINI_PROMPT, "gemini_lite_prompt", models=GEMINI_LITE_MODELS),
         "mistral": lambda: _extract_with_mistral_prompt(file_path, GEMINI_PROMPT, "mistral_prompt"),
         "groq_text": lambda: _extract_with_groq_prompt(file_path, GEMINI_PROMPT, "groq_prompt"),
         "openrouter": lambda: _extract_with_openrouter_prompt(file_path, GEMINI_PROMPT, "openrouter_prompt"),
     }
 
 
+_BILL_KEY_FIELDS = ("bill_number", "bill_date", "vehicle_number", "quantity_qtl", "rate_per_qtl", "total_amount", "vendor_name")
+
+
 def _reader_failed(payload) -> bool:
+    """A reader counts as a voter if it read at least one key field; honest nulls are fine."""
     if not isinstance(payload, dict):
         return True
-    if not payload.get("error"):
-        return not any(payload.get(k) for k in ("bill_number", "total_amount", "vehicle_number", "vendor_name"))
-    return not any(payload.get(k) for k in ("bill_number", "total_amount", "vehicle_number"))
+    return not any(payload.get(k) not in (None, "", "null") for k in _BILL_KEY_FIELDS)
 
 
 async def _run_reader(name: str, fn) -> dict:
@@ -5032,8 +5075,11 @@ async def extract_bill_verified(file_path: str, preferred_provider: Optional[str
     has_text = len(pdf_text.strip()) >= 60
     readers = _bill_readers(file_path)
 
-    vision_order = ["gemini", "mistral", "openrouter"]
-    second_order = (["groq_text"] if has_text else []) + ["mistral", "openrouter", "gemini"]
+    # Second reader should be a different vendor where possible (Mistral), then a
+    # different Gemini model with its own quota. OpenRouter free is slow and often
+    # rate-limited, so it is the last resort.
+    vision_order = ["gemini", "gemini_lite", "mistral", "openrouter"]
+    second_order = (["groq_text"] if has_text else []) + ["mistral", "gemini_lite", "gemini", "openrouter"]
     pref = str(preferred_provider or "").strip().lower()
     if pref == "groq":
         pref = "groq_text"

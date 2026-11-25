@@ -3990,6 +3990,11 @@ async def _reparse_pending_ingest_record(
 
     unclear_fields = extracted.get("unclear_fields") if isinstance(extracted.get("unclear_fields"), list) else []
 
+    if doc_enum == DocumentType.purchase_bill and isinstance(extracted, dict):
+        firm_id = _annotate_purchase_bill_firm(db, extracted)
+        if firm_id and p.company_id is None and p.assigned_company_id is None:
+            p.company_id = firm_id
+
     p.document_type = doc_enum
     p.classifier_confidence = cls_conf
     p.classifier_candidates = cls_candidates or []
@@ -4021,6 +4026,51 @@ OWN_COMPANY_IDENTIFIERS = [
     {"name": "shree vinayak trading company", "email": "vtcjaipur2012@gmail.com"},
     {"name": "shree ganpati enterprises", "email": "vinayakkhandelwal88@gmail.com"},
 ]
+
+def _annotate_purchase_bill_firm(db: Session, extracted: dict) -> Optional[int]:
+    """Work out which of our firms a purchase bill belongs to, from the bill itself.
+
+    A supplier's bill names our firm as the buyer ("Bill to"). If instead the
+    SELLER is one of our firms, the document is our own sales bill and must not
+    be booked as a purchase. Adds review reasons and returns the company id.
+    """
+    if not isinstance(extracted, dict):
+        return None
+    reasons = extracted.get("review_reasons") if isinstance(extracted.get("review_reasons"), list) else []
+
+    def _own_firm(name: Optional[str], min_score: float) -> Optional[str]:
+        src_n = _norm_text(re.sub(r"(?i)^\s*m\s*/?\s*s\.?\s*", "", str(name or "")))
+        if len(src_n) < 6:
+            return None
+        for nm in _OWN_COMPANY_CANONICAL_NAMES:
+            if _norm_text(nm) in src_n:
+                return nm
+        best = max(_OWN_COMPANY_CANONICAL_NAMES, key=lambda nm: _name_similarity(src_n, nm))
+        return best if _name_similarity(src_n, best) >= min_score else None
+
+    seller_firm = _own_firm(extracted.get("vendor_name"), 0.85)
+    buyer_firm = _own_firm(extracted.get("buyer_name"), 0.75)
+
+    company_id = None
+    if seller_firm:
+        reasons.append(
+            f"Seller on this bill is your own firm ({seller_firm}); this looks like a SALES bill, not a purchase bill"
+        )
+        extracted["looks_like_own_sales_bill"] = True
+    elif buyer_firm:
+        company_id = _find_company_exact(db, buyer_firm)
+        extracted["detected_company"] = buyer_firm
+    elif extracted.get("buyer_name"):
+        reasons.append(f"Buyer '{extracted.get('buyer_name')}' is not one of your three firms")
+    else:
+        reasons.append("Buyer firm not found on the bill; choose the firm manually")
+
+    if seller_firm or not company_id:
+        extracted["high_confidence"] = False
+        extracted["needs_review"] = True
+    extracted["review_reasons"] = reasons
+    return company_id
+
 
 _PO_ALLOWED_MATERIALS = {"Maize", "Dorb", "Domc", "Rice DDGS"}
 _PO_PLANT_DISPLAY = {
@@ -4858,6 +4908,14 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
     doc_type = p.document_type.value if p.document_type else ""
 
     if doc_type == "purchase_bill":
+        if payload.get("looks_like_own_sales_bill"):
+            return {
+                "document_type": doc_type,
+                "manual_required": True,
+                "reason": "Seller is one of your own firms: this is a sales bill, not a purchase bill.",
+            }
+        if company_id is None:
+            company_id = _annotate_purchase_bill_firm(db, dict(payload))
         plant_name = payload.get("destination_plant") or payload.get("plant_name")
         plant_id, plant_name_resolved = _resolve_plant(db, plant_name)
         bill_date = _parse_optional_date(payload.get("bill_date"))
