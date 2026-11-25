@@ -82,7 +82,9 @@ def fetch_pending_busy_vouchers(config: dict) -> bool:
         url,
         headers={
             "User-Agent": "RCDF-Busy-Win7-Agent/1.0",
-            "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            # Server login is on: the agent proves itself with MACHINE_API_KEY.
+            "X-API-Key": str(config.get("api_key") or ""),
         }
     )
 

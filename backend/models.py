@@ -783,7 +783,6 @@ class User(Base):
     full_name     = Column(String(150))
     password_hash = Column(String(255), nullable=False)
     role          = Column(Enum(UserRole), nullable=False, default=UserRole.viewer)
-    company_ids   = Column(JSON, nullable=True)      # null/empty = all firms
     is_active     = Column(Boolean, default=True)
     last_login_at = Column(DateTime)
     created_at    = Column(DateTime, default=func.now())

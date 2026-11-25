@@ -730,7 +730,13 @@ async def _email_sync_scheduler_loop(stop_event: asyncio.Event) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_dirs()
+    if str(os.getenv("AUTO_MIGRATE", "true")).lower() not in ("0", "false", "no", "off"):
+        import migrations
+        ran = migrations.upgrade(engine)
+        if ran:
+            log.info("Database migrations applied: %s", ", ".join(ran))
     _ensure_runtime_schema()
+    _bootstrap_admin_from_env()
 
     stop_event = asyncio.Event()
     app.state.email_sync_stop_event = stop_event
@@ -750,6 +756,214 @@ async def lifespan(app: FastAPI):
                 pass
 
 app = FastAPI(title="RCDF Supply Operations", version="1.0.0", lifespan=lifespan)
+
+
+# ── LOGIN AND ROLES ────────────────────────────────────────────────────────
+
+from services import auth as auth_svc  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+from starlette.concurrency import run_in_threadpool  # noqa: E402
+
+
+def _bootstrap_admin_from_env() -> None:
+    """First admin from ADMIN_USERNAME / ADMIN_PASSWORD when there are no users yet."""
+    username = os.getenv("ADMIN_USERNAME", "").strip()
+    password = os.getenv("ADMIN_PASSWORD", "")
+    if not username or not password:
+        return
+    with SessionLocal() as db:
+        if auth_svc.user_count(db) == 0:
+            db.add(User(username=username, full_name="Administrator",
+                        password_hash=auth_svc.hash_password(password), role=UserRole.admin))
+            db.commit()
+            log.info("Created first admin user %s from environment", username)
+
+
+def _request_token(request: Request) -> Optional[str]:
+    h = request.headers.get("authorization") or ""
+    if h.lower().startswith("bearer "):
+        return h[7:].strip()
+    return request.cookies.get(auth_svc.COOKIE_NAME)
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if not auth_svc.auth_enabled() or not auth_svc.is_protected_path(path):
+        return await call_next(request)
+    status, user, msg = await run_in_threadpool(
+        auth_svc.check_request, request.method, path, _request_token(request),
+        request.headers.get("x-api-key"), request.client.host if request.client else None,
+        auth_svc.session_factory or SessionLocal,
+    )
+    if status != 200:
+        return JSONResponse({"detail": msg}, status_code=status)
+    request.state.user = user
+    return await call_next(request)
+
+
+def _user_to_dict(u: User) -> dict:
+    return {"id": u.id, "username": u.username, "full_name": u.full_name,
+            "role": u.role.value if u.role else None, "is_active": bool(u.is_active),
+            "last_login_at": str(u.last_login_at) if u.last_login_at else None}
+
+
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+class UserCreatePayload(BaseModel):
+    username: str
+    password: str
+    full_name: Optional[str] = None
+    role: str = "viewer"
+
+
+class UserUpdatePayload(BaseModel):
+    full_name: Optional[str] = None
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+    password: Optional[str] = None
+
+
+class PasswordChangePayload(BaseModel):
+    current_password: str
+    new_password: str
+
+
+def _set_session_cookie(request: Request, resp: Response, token: str) -> None:
+    resp.set_cookie(auth_svc.COOKIE_NAME, token, httponly=True, samesite="lax",
+                    secure=request.url.scheme == "https", max_age=auth_svc.session_days() * 86400, path="/")
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request, db: Session = Depends(get_db)):
+    enabled = auth_svc.auth_enabled()
+    user = auth_svc.user_for_token(db, _request_token(request)) if enabled else None
+    return {"auth_enabled": enabled, "user": _user_to_dict(user) if user else None,
+            "needs_first_admin": enabled and auth_svc.user_count(db) == 0}
+
+
+@app.post("/api/auth/login")
+def auth_login(data: LoginPayload, request: Request, db: Session = Depends(get_db)):
+    key = f"{data.username.strip().lower()}|{request.client.host if request.client else ''}"
+    if auth_svc.login_locked(key):
+        raise HTTPException(429, "Too many wrong attempts. Try again in 5 minutes.")
+    u = db.execute(select(User).where(func.lower(User.username) == data.username.strip().lower())).scalar_one_or_none()
+    if not u or not u.is_active or not auth_svc.verify_password(data.password, u.password_hash):
+        auth_svc.record_login_failure(key)
+        raise HTTPException(401, "Wrong username or password")
+    auth_svc.clear_login_failures(key)
+    token = auth_svc.create_session(db, u, request.headers.get("user-agent"))
+    db.commit()
+    resp = JSONResponse({"user": _user_to_dict(u), "token": token})
+    _set_session_cookie(request, resp, token)
+    return resp
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, db: Session = Depends(get_db)):
+    auth_svc.revoke_token(db, _request_token(request))
+    db.commit()
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(auth_svc.COOKIE_NAME, path="/")
+    return resp
+
+
+@app.post("/api/auth/bootstrap")
+def auth_bootstrap(data: UserCreatePayload, request: Request, db: Session = Depends(get_db)):
+    """Create the first admin. Works only while there are no users at all."""
+    if auth_svc.user_count(db) > 0:
+        raise HTTPException(403, "Users already exist. Ask an admin to add you.")
+    problem = auth_svc.password_problem(data.password)
+    if problem or not data.username.strip():
+        raise HTTPException(400, problem or "Username is required")
+    u = User(username=data.username.strip(), full_name=data.full_name,
+             password_hash=auth_svc.hash_password(data.password), role=UserRole.admin)
+    db.add(u)
+    db.flush()
+    token = auth_svc.create_session(db, u, request.headers.get("user-agent"))
+    db.commit()
+    resp = JSONResponse({"user": _user_to_dict(u), "token": token})
+    _set_session_cookie(request, resp, token)
+    return resp
+
+
+@app.post("/api/auth/password")
+def auth_change_password(data: PasswordChangePayload, request: Request, db: Session = Depends(get_db)):
+    u = auth_svc.user_for_token(db, _request_token(request))
+    if not u:
+        raise HTTPException(401, "Please log in")
+    if not auth_svc.verify_password(data.current_password, u.password_hash):
+        raise HTTPException(400, "Current password is wrong")
+    problem = auth_svc.password_problem(data.new_password)
+    if problem:
+        raise HTTPException(400, problem)
+    u.password_hash = auth_svc.hash_password(data.new_password)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/auth/users")
+def auth_list_users(db: Session = Depends(get_db)):
+    return [_user_to_dict(u) for u in db.execute(select(User).order_by(User.username)).scalars().all()]
+
+
+@app.post("/api/auth/users")
+def auth_create_user(data: UserCreatePayload, db: Session = Depends(get_db)):
+    problem = auth_svc.password_problem(data.password)
+    if problem or not data.username.strip():
+        raise HTTPException(400, problem or "Username is required")
+    try:
+        role = UserRole(data.role)
+    except ValueError:
+        raise HTTPException(400, "Role must be admin, accountant, operator or viewer")
+    if db.execute(select(User.id).where(func.lower(User.username) == data.username.strip().lower())).first():
+        raise HTTPException(400, "That username is taken")
+    u = User(username=data.username.strip(), full_name=data.full_name,
+             password_hash=auth_svc.hash_password(data.password), role=role)
+    db.add(u)
+    db.commit()
+    return _user_to_dict(u)
+
+
+@app.patch("/api/auth/users/{user_id}")
+def auth_update_user(user_id: int, data: UserUpdatePayload, request: Request, db: Session = Depends(get_db)):
+    u = db.get(User, user_id)
+    if not u:
+        raise HTTPException(404, "User not found")
+    me = getattr(request.state, "user", None)
+    if data.role is not None:
+        try:
+            new_role = UserRole(data.role)
+        except ValueError:
+            raise HTTPException(400, "Role must be admin, accountant, operator or viewer")
+        if u.role == UserRole.admin and new_role != UserRole.admin and _active_admins(db) <= 1:
+            raise HTTPException(400, "Keep at least one admin")
+        u.role = new_role
+    if data.is_active is not None:
+        if not data.is_active and u.role == UserRole.admin and _active_admins(db) <= 1:
+            raise HTTPException(400, "Keep at least one active admin")
+        if not data.is_active and me is not None and me.id == u.id:
+            raise HTTPException(400, "You cannot deactivate yourself")
+        u.is_active = data.is_active
+        if not data.is_active:
+            auth_svc.revoke_user_sessions(db, u.id)
+    if data.full_name is not None:
+        u.full_name = data.full_name
+    if data.password:
+        problem = auth_svc.password_problem(data.password)
+        if problem:
+            raise HTTPException(400, problem)
+        u.password_hash = auth_svc.hash_password(data.password)
+        auth_svc.revoke_user_sessions(db, u.id)
+    db.commit()
+    return _user_to_dict(u)
+
+
+def _active_admins(db: Session) -> int:
+    return int(db.execute(select(func.count(User.id)).where(User.role == UserRole.admin, User.is_active == True)).scalar() or 0)
 
 app.add_middleware(
     CORSMiddleware,
@@ -10782,7 +10996,8 @@ def download_busy_agent_package(request: Request):
         "import_filename": "Book1.xlsx",
         "poll_interval_seconds": 60,
         "auto_backup": True,
-        "api_key": ""
+        # Admin-only download, so it can carry the key the server expects from the agent.
+        "api_key": os.getenv("MACHINE_API_KEY", "")
     }
 
     readme_text = f"""========================================================================
