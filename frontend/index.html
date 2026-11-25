@@ -719,6 +719,31 @@ function statusPill(s) {
   };
   return `<span class="pill ${map[s] || 'pill-muted'}">${s?.replace('_', ' ')}</span>`;
 }
+// Multi-reader AI verification result for a purchase bill (see backend/services/bill_verifier.py).
+function aiCheckBadge(payload) {
+  const v = payload && payload.verification;
+  if (!v) return '<span style="color:var(--muted);font-size:11px">—</span>';
+  const pct = Math.round(Number(v.confidence || 0) * 100);
+  const reasons = (payload.review_reasons || []).join(' | ');
+  if (v.auto_approve_ok) return `<span class="pill pill-active" title="All key fields confirmed by ${escapeHtml((v.sources_used||[]).join(' + '))}">✓ verified ${pct}%</span>`;
+  const n = (payload.review_reasons || []).length;
+  return `<span class="pill pill-pending" title="${escapeHtml(reasons)}">review · ${n} issue${n===1?'':'s'} · ${pct}%</span>`;
+}
+function aiCheckDetails(payload) {
+  const v = payload && payload.verification;
+  if (!v) return '';
+  const label = {agreed:'✓ readers agree', grounded:'✓ matches PDF text', resolved_by_text:'✓ fixed using PDF text', resolved_by_math:'✓ fixed using bill math', single:'⚠ one reader only', conflict:'✗ readers disagree', missing:'✗ not found'};
+  const rows = ['bill_number','bill_date','vehicle_number','quantity_qtl','rate_per_qtl','total_amount','vendor_name','buyer_name','vendor_gstin','buyer_gstin'].filter(k => v.fields && v.fields[k]).map(k => {
+    const f = v.fields[k];
+    const alts = (f.alternatives || []).map(a => escapeHtml(String(a.value))).join(', ');
+    const bad = ['single','conflict','missing'].includes(f.status);
+    return `<tr><td>${k.replace(/_/g,' ')}</td><td class="num">${escapeHtml(String(f.value ?? '—'))}</td><td style="color:${bad?'var(--danger)':'var(--success)'}">${label[f.status] || f.status}${alts ? ' (other: ' + alts + ')' : ''}</td></tr>`;
+  }).join('');
+  const reasons = (payload.review_reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
+  return `<div class="form-field"><div class="form-label">AI check: ${aiCheckBadge(payload)} <span style="color:var(--muted);font-weight:400">read by ${escapeHtml((v.sources_used||[]).join(' + ') || 'none')}</span></div>
+    ${reasons ? `<ul style="margin:4px 0 8px 18px;color:var(--warn);font-size:12px">${reasons}</ul>` : ''}
+    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Field</th><th>Value</th><th>Check</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
 function fmtAmt(v) { return v ? '₹' + parseFloat(v).toLocaleString('en-IN', { maximumFractionDigits: 0 }) : '—'; }
 function fmtMT(v) { return v ? parseFloat(v).toFixed(1) + ' Qtl' : '—'; }
 // All quantities in RCDF are stored in quintals (legacy field names end in _mt).
@@ -1351,7 +1376,7 @@ pages['pending-ingests'] = {
 
           <div id="pi-table-wrap" class="tbl-wrap" tabindex="0" onkeydown="pages['pending-ingests'].onSelectionKeydown(event)">
             <table class="tbl">
-              <thead><tr><th style="width:30px"></th><th>ID</th><th>Type</th><th>Status</th><th>File</th><th>Confidence</th><th>Unclear</th><th>Assigned</th><th></th></tr></thead>
+              <thead><tr><th style="width:30px"></th><th>ID</th><th>Type</th><th>Status</th><th>File</th><th>Confidence</th><th>AI check</th><th>Unclear</th><th>Assigned</th><th></th></tr></thead>
               <tbody>
                 ${(rows || []).map(r => `
                   <tr data-pi-id="${r.id}" onmouseenter="pages['pending-ingests'].onSelectionRowEnter(event, ${r.id})">
@@ -1361,6 +1386,7 @@ pages['pending-ingests'] = {
                     <td>${statusPill(r.status || 'pending')}</td>
                     <td>${escapeHtml(r.file_name || '-')}</td>
                     <td class="num">${r.classifier_confidence != null ? Number(r.classifier_confidence).toFixed(3) : '—'}</td>
+                    <td>${aiCheckBadge(r.extracted_payload)}</td>
                     <td class="num">${Array.isArray(r.unclear_fields) ? r.unclear_fields.length : 0}</td>
                     <td style="font-size:11px;color:var(--muted)">${r.assigned_company_id || '-'} / ${r.assigned_main_tender_id || '-'} / ${r.assigned_tender_id || '-'}</td>
                     <td style="display:flex;gap:6px;flex-wrap:wrap">
@@ -1630,6 +1656,7 @@ pages['pending-ingests'] = {
               <div class="form-field"><div class="form-label">Type</div><input class="form-input" value="${escapeHtml(row.document_type || '')}" readonly></div>
               <div class="form-field"><div class="form-label">Status</div><input class="form-input" value="${escapeHtml(row.status || '')}" readonly></div>
             </div>
+            ${aiCheckDetails(row.extracted_payload)}
             <div class="form-field"><div class="form-label">Extracted payload</div><textarea class="form-input" style="height:320px;font-family:var(--mono)" readonly>${escapeHtml(JSON.stringify(row.extracted_payload || {}, null, 2))}</textarea></div>
           </div>
         </div>

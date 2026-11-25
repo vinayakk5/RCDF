@@ -478,7 +478,17 @@ Extract ALL fields below. Return ONLY a valid JSON object — no markdown, no ex
   "total_amount": <Grand Total in INR as a number. Indian format: 8,09,848 = 809848>,
   "bill_date": "Date of bill if visible, else null. Look for any date format or similar patterns of date",
   "bill_number": "Invoice number e.g. 184",
-  "gstin_vendor": "GSTIN of the seller if visible",
+  "gstin_vendor": "GSTIN of the seller if visible (15 characters, copy exactly)",
+  "buyer_name": "The BUYER / 'Bill to' / 'Consignee' party name (the company purchasing), copy exactly, else null",
+  "buyer_gstin": "GSTIN of the buyer / bill-to party if visible (15 characters, copy exactly), else null",
+  "taxable_amount": <taxable value before GST as a number, else null>,
+  "cgst_amount": <CGST amount as a number or null>,
+  "sgst_amount": <SGST amount as a number or null>,
+  "igst_amount": <IGST amount as a number or null>,
+  "quantity_printed": <the weight number exactly as printed on the bill, no conversion>,
+  "quantity_unit_printed": "unit printed next to that weight: Qtl, MT, Kg, or null if none printed",
+  "rate_printed": <the rate number exactly as printed, no conversion>,
+  "rate_unit_printed": "unit the rate is per: Qtl, MT, Kg, or null if not printed",
   "broker_name": "Broker name if mentioned on bill e.g. YESH DALAL",
   "destination_plant": "Delivery location / plant name if mentioned e.g. Kaladera, Bikaner,jodhpur, Ajmer,nadbai,pali, lambiyan ,Kaladera, bhilwara. Look for 'Delivery at' or 'Shipped to' CATTLE FEED PLANT NADBAI means plant name is Nadbai, if you see only NADBAI then also its plant name, if you see KALADERA or KALADERS then plant name is Kaladers",
   "transport_company": "Transport/logistics company name if visible",
@@ -492,6 +502,7 @@ Critical rules:
 - quantity_qtl must always be in Quintal — convert if needed,its the number under/near QTY./quantity weight of material, dont take number of bags in this field or near witg kgs as unit
 - Indian lakh format: 8,09,848 = 809848 (not 80984.8)
 - Never invent vehicle numbers — return null if unclear
+- Copy numbers digit by digit. Never guess a digit; use null for anything you cannot read clearly
 - bill_number is just the number e.g. "184" not "Invoice No. 184"
 - For destination_plant: "KALADERA" or "KALADERS" = "Kaladers"  Kaladera, Bikaner,jodhpur, Ajmer,nadbai,pali, lambiyan ,Kaladera, bhilwara. Look for 'Delivery at' or 'Shipped to' CATTLE FEED PLANT NADBAI means plant name is Nadbai, if you see only NADBAI then also its plant name, if you see KALADERA or KALADERS then plant name is Kaladers",
 """
@@ -1100,7 +1111,13 @@ async def extract_with_azure(image_path: str) -> dict:
 # ── Main router ───────────────────────────────────────────────────────────
 
 async def extract_bill(image_path: str) -> dict:
+    """Purchase bill extraction used by upload endpoints: verified multi-reader pipeline."""
+    return await extract_bill_verified(image_path)
+
+
+async def _extract_bill_legacy(image_path: str) -> dict:
     """
+    Legacy first-high-confidence-wins router, kept only as a last resort.
     Priority: 0. PDF Text Fast Path (PyMuPDF + Groq Qwen 2.5), 1. Gemini (2.5 Flash), 2. Mistral (Pixtral), 3. OpenRouter Free
     """
     log.info(f"Extracting bill: {image_path}")
@@ -4953,6 +4970,162 @@ async def extract_rejection_notice(file_path: str, preferred_provider: Optional[
     return result
 
 
+# ── Verified bill extraction (multiple free readers + deterministic checks) ──
+
+def _pdf_text_layer(file_path: str) -> str:
+    if Path(file_path).suffix.lower() != ".pdf":
+        return ""
+    try:
+        import fitz
+        doc = fitz.open(file_path)
+        try:
+            return "\n".join(page.get_text() for page in doc)
+        finally:
+            doc.close()
+    except Exception as e:
+        log.warning("PDF text layer read failed for %s: %s", file_path, e)
+        return ""
+
+
+def _bill_readers(file_path: str) -> dict:
+    """Free bill readers by name. Each returns a dict, with "error" on failure."""
+    return {
+        "gemini": lambda: _extract_with_gemini_prompt(file_path, GEMINI_PROMPT, "gemini_prompt"),
+        "mistral": lambda: _extract_with_mistral_prompt(file_path, GEMINI_PROMPT, "mistral_prompt"),
+        "groq_text": lambda: _extract_with_groq_prompt(file_path, GEMINI_PROMPT, "groq_prompt"),
+        "openrouter": lambda: _extract_with_openrouter_prompt(file_path, GEMINI_PROMPT, "openrouter_prompt"),
+    }
+
+
+def _reader_failed(payload) -> bool:
+    if not isinstance(payload, dict):
+        return True
+    if not payload.get("error"):
+        return not any(payload.get(k) for k in ("bill_number", "total_amount", "vehicle_number", "vendor_name"))
+    return not any(payload.get(k) for k in ("bill_number", "total_amount", "vehicle_number"))
+
+
+async def _run_reader(name: str, fn) -> dict:
+    try:
+        res = await asyncio.wait_for(fn(), timeout=float(os.getenv("BILL_READER_TIMEOUT_SEC", "90")))
+    except asyncio.TimeoutError:
+        return {"source": name, "error": "timeout"}
+    except Exception as e:
+        return {"source": name, "error": str(e)[:300]}
+    if not isinstance(res, dict):
+        return {"source": name, "error": "invalid response"}
+    return _normalize_model_bill_payload(res)
+
+
+async def extract_bill_verified(file_path: str, preferred_provider: Optional[str] = None) -> dict:
+    """Read a purchase bill with two independent free readers and verify field by field.
+
+    Order: a vision reader (Gemini, else Mistral) and an independent second reader
+    (Groq on the PDF text layer for digital PDFs, else another vision model). A third
+    reader is called only when the first two leave a key field unresolved, to save
+    free quota. Confidence and auto-approval come from bill_verifier, never from the
+    model's own confidence.
+    """
+    from services.bill_verifier import CRITICAL_FIELDS, VERIFIED_STATUSES, verify_bill
+
+    pdf_text = _pdf_text_layer(file_path)
+    has_text = len(pdf_text.strip()) >= 60
+    readers = _bill_readers(file_path)
+
+    vision_order = ["gemini", "mistral", "openrouter"]
+    second_order = (["groq_text"] if has_text else []) + ["mistral", "openrouter", "gemini"]
+    pref = str(preferred_provider or "").strip().lower()
+    if pref == "groq":
+        pref = "groq_text"
+    if pref in readers:
+        vision_order = [pref] + [r for r in vision_order if r != pref]
+
+    readings: List[Tuple[str, dict]] = []
+    attempts: List[dict] = []
+    used: set = set()
+
+    async def try_order(order: List[str], want: int = 1) -> int:
+        got = 0
+        for name in order:
+            if got >= want:
+                break
+            if name in used:
+                continue
+            if name == "groq_text" and not has_text:
+                continue
+            used.add(name)
+            t0 = time.time()
+            res = await _run_reader(name, readers[name])
+            ok = not _reader_failed(res)
+            attempts.append({
+                "provider": name,
+                "status": "ok" if ok else "error",
+                "seconds": round(time.time() - t0, 1),
+                "error": None if ok else str(res.get("error") or "no fields read")[:300],
+            })
+            if ok:
+                readings.append((name, res))
+                got += 1
+        return got
+
+    await try_order(vision_order, 1)
+    await try_order(second_order, 1)
+    verification = verify_bill(readings, pdf_text)
+
+    unresolved = [f for f in CRITICAL_FIELDS if verification["fields"][f]["status"] not in VERIFIED_STATUSES]
+    if unresolved and len(readings) < 3:
+        if await try_order(second_order + vision_order, 1):
+            verification = verify_bill(readings, pdf_text)
+
+    if not readings:
+        legacy = await _extract_bill_legacy(file_path)
+        legacy["verification"] = verification
+        legacy["provider_attempts"] = attempts
+        legacy["high_confidence"] = False
+        legacy["needs_review"] = True
+        legacy["review_reasons"] = ["All free AI readers failed; values below are unverified"]
+        return legacy
+
+    primary = dict(readings[0][1])
+    vals = verification["values"]
+    out = dict(primary)
+    for key in ["bill_number", "bill_date", "vehicle_number", "quantity_qtl", "rate_per_qtl", "total_amount",
+                "taxable_amount", "vendor_name", "material_type", "destination_plant", "buyer_name"]:
+        if vals.get(key) is not None or key in CRITICAL_FIELDS:
+            out[key] = vals.get(key)
+    if vals.get("vendor_gstin"):
+        out["gstin_vendor"] = vals["vendor_gstin"]
+        out["vendor_gstin"] = vals["vendor_gstin"]
+    if vals.get("buyer_gstin"):
+        out["buyer_gstin"] = vals["buyer_gstin"]
+    out["raw_text"] = pdf_text[:20000] if has_text else (primary.get("raw_text") or "")
+
+    out = _validate_bill(out)  # keeps legacy validation_* flags for existing screens
+    # Verified values win over the legacy validator's unit guesses.
+    for key in ("quantity_qtl", "rate_per_qtl"):
+        out[key] = vals.get(key)
+    checks = verification["checks"]
+    out["validation_amount"] = checks.get("math") is True
+    out["validation_vehicle"] = (
+        checks.get("vehicle_format") is True
+        and verification["fields"]["vehicle_number"]["status"] in VERIFIED_STATUSES
+    )
+
+    out["source"] = "+".join(n for n, _ in readings)
+    out["confidence"] = verification["confidence"]
+    out["ocr_confidence"] = verification["confidence"]
+    out["high_confidence"] = bool(verification["auto_approve_ok"])
+    out["needs_review"] = not verification["auto_approve_ok"]
+    out["review_reasons"] = verification["review_reasons"]
+    out["unclear_fields"] = [f for f in CRITICAL_FIELDS if verification["fields"][f]["status"] not in VERIFIED_STATUSES]
+    out["fields_found"] = _count_bill_fields(out)
+    out["verification"] = {k: verification[k] for k in (
+        "fields", "checks", "confidence", "auto_approve_ok", "sources_used", "sources_failed",
+        "unit_corrections", "pdf_text_used")}
+    out["provider_attempts"] = attempts
+    return out
+
+
 async def extract_document_by_type(file_path: str, document_type: str, prefer_ocr_engine: Optional[str] = None) -> dict:
     doc_type = str(document_type or "").strip().lower()
     if doc_type not in SUPPORTED_DOCUMENT_TYPES:
@@ -4963,20 +5136,7 @@ async def extract_document_by_type(file_path: str, document_type: str, prefer_oc
         provider_key = None
 
     if doc_type == "purchase_bill":
-        res = await _extract_with_prompt_chain(file_path, GEMINI_PROMPT, "purchase_bill", preferred_provider=provider_key)
-        if isinstance(res, dict):
-            res = _normalize_model_bill_payload(res)
-            if "quantity_qtl" not in res and "quantity_mt" in res:
-                try:
-                    res["quantity_qtl"] = round(float(res["quantity_mt"]) * 10, 3)
-                except Exception:
-                    pass
-            res["fields_found"] = _count_bill_fields(res)
-            conf = float(res.get("confidence") or 0)
-            res["high_confidence"] = (res.get("fields_found", 0) >= 5) or (res.get("fields_found", 0) >= 4 and conf >= 0.65)
-        # Fallback to full router if Groq bill path fails hard.
-        if (not provider_key) and (not isinstance(res, dict) or (str(res.get("error") or "") and (res.get("fields_found") or 0) == 0)):
-            res = await extract_bill(file_path)
+        res = await extract_bill_verified(file_path, preferred_provider=provider_key)
     elif doc_type == "plant_unloading":
         res = await extract_plant_unloading_sheet(file_path, preferred_provider=provider_key)
     elif doc_type == "tender_notice":
