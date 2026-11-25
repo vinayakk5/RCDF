@@ -37,6 +37,15 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 .nb-info{background:var(--accent);}
 .sidebar-footer{padding:12px;border-top:1px solid var(--border);font-size:11px;color:var(--muted);}
 .cycle-name{font-family:var(--mono);font-size:10px;color:var(--accent);margin-top:3px;}
+.login-screen{position:fixed;inset:0;z-index:9999;background:var(--bg);display:none;align-items:center;justify-content:center;padding:16px;}
+.login-screen.show{display:flex;}
+.login-box{width:100%;max-width:340px;background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px;}
+.login-box .form-field{margin-bottom:12px;}
+.login-err{color:var(--danger);font-size:12px;min-height:16px;margin-bottom:8px;}
+.user-chip{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;color:var(--text);}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:12px;}
+.seg button{background:none;border:0;color:var(--muted);padding:7px 14px;font:inherit;font-size:12px;cursor:pointer;}
+.seg button.on{background:var(--bg4);color:var(--text);}
 
 /* MAIN */
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden;}
@@ -467,12 +476,27 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 2"/></svg>
       Reports
     </div>
+    <div class="nav-item" onclick="nav('auto-approval',this)">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 8l3 3 7-7"/><circle cx="8" cy="8" r="7"/></svg>
+      Auto-approval
+    </div>
+    <div class="nav-item" id="nav-users" style="display:none" onclick="nav('users',this)">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="5" r="3"/><path d="M2 15c0-3.3 2.7-6 6-6s6 2.7 6 6"/></svg>
+      Users
+    </div>
     <div class="nav-item" onclick="nav('brokers',this)">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="5" r="3"/><path d="M1 14c0-3 2.5-5 5-5s5 2 5 5"/><path d="M13 8a2 2 0 100-4"/><path d="M16 14c0-2-1-3.5-3-4"/></svg>
       Brokers
     </div>
   </nav>
   <div class="sidebar-footer">
+    <div class="user-chip" id="user-chip" style="display:none">
+      <span id="user-chip-name"></span>
+      <span style="display:flex;gap:4px">
+        <button class="btn btn-xs" onclick="auth.openPassword()">Password</button>
+        <button class="btn btn-xs" onclick="auth.logout()">Log out</button>
+      </span>
+    </div>
     <div id="footer-cycle">Loading cycle...</div>
   </div>
 </div>
@@ -519,6 +543,8 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
   <div id="page-reports" class="page" style="overflow-y:auto;"></div>
   <div id="page-brokers" class="page" style="overflow-y:auto;"></div>
   <div id="page-audit" class="page" style="overflow-y:auto;"></div>
+  <div id="page-auto-approval" class="page" style="overflow-y:auto;"></div>
+  <div id="page-users" class="page" style="overflow-y:auto;"></div>
 </div>
 
 
@@ -532,6 +558,17 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
 </nav>
 <button class="cam-fab" id="cam-fab" aria-label="Take photo" onclick="camFabClick()"><svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 5h2.5l1.2-1.8h4.6L11.5 5H14v8H2z"/><circle cx="8" cy="9" r="2.4"/></svg></button>
 <div class="toast" id="toast-el"></div>
+<div class="login-screen" id="login-screen">
+  <form class="login-box" onsubmit="event.preventDefault();auth.submit()">
+    <div class="logo-main" style="margin-bottom:4px">RCDF Supply</div>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:16px" id="login-sub">Log in to continue</div>
+    <div class="form-field" id="login-name-field" style="display:none"><div class="form-label">Your name</div><input class="form-input" id="login-fullname" autocomplete="name"></div>
+    <div class="form-field"><div class="form-label">Username</div><input class="form-input" id="login-user" autocomplete="username" autocapitalize="none"></div>
+    <div class="form-field"><div class="form-label">Password</div><input class="form-input" id="login-pass" type="password" autocomplete="current-password"></div>
+    <div class="login-err" id="login-err"></div>
+    <button class="btn btn-primary" style="width:100%" type="submit" id="login-btn">Log in</button>
+  </form>
+</div>
 <div id="modal-container"></div>
 
 <script>
@@ -559,7 +596,7 @@ function hasScopedContext() {
 }
 
 function canAccessWorkspace(page) {
-  if (page === 'home' || page === 'pending-ingests' || page === 'busy-staging' || page === 'whatsapp') return true;
+  if (page === 'home' || page === 'pending-ingests' || page === 'busy-staging' || page === 'whatsapp' || page === 'auto-approval' || page === 'users') return true;
   if (state.globalView) return true;
   return hasScopedContext();
 }
@@ -797,7 +834,8 @@ function nav(page, el) {
     bills: 'Bill Review', dispatch: 'Dispatch Tracking',
     'purchase-bills': 'Purchase Bills', 'busy-export': 'Busy Export', 'busy-staging': 'Busy Staging', 'sales-bills': 'Sales Bills',
     payments: 'Payments', market: 'Market Prices', reports: 'Reports', brokers: 'Brokers',
-    audit: 'Audit Logs', receipts: 'Receipts', 'plant-details': 'Plant Unloading Details'
+    audit: 'Audit Logs', receipts: 'Receipts', 'plant-details': 'Plant Unloading Details',
+    'auto-approval': 'Auto-approval', users: 'Users'
   };
   document.getElementById('page-title').textContent = titles[page] || page;
   toggleSidebar(false);
@@ -849,6 +887,7 @@ async function apiFetch(path, opts = {}) {
       headers: { 'Content-Type': 'application/json' },
       ...opts,
     });
+    if (r.status === 401) { auth.show(); throw new Error('Please log in'); }
     if (!r.ok) {
       const err = await r.text();
       throw new Error(err);
@@ -866,6 +905,7 @@ async function apiFetchRaw(path, opts = {}) {
       headers: { 'Content-Type': 'application/json' },
       ...opts,
     });
+    if (r.status === 401) { auth.show(); throw new Error('Please log in'); }
     if (!r.ok) {
       const err = await r.text();
       throw new Error(err);
@@ -2821,6 +2861,10 @@ pages.tenders = {
             <div class="form-field"><div class="form-label">Supply period to <span style="color:var(--muted);font-weight:400">(change on time extension)</span></div><input class="form-input" id="tf-se" type="date" value="${t.supply_end || ''}"></div>
           </div>
           <div class="form-field">
+            <div class="form-label">Our sale rate to plant, ₹ per qtl <span style="color:var(--muted);font-weight:400">(from the PO; used on sales bills)</span></div>
+            <input class="form-input" id="tf-rate" type="number" step="0.01" value="${t.sale_rate_per_qtl ?? ''}">
+          </div>
+          <div class="form-field">
             <div class="form-label">Status</div>
             <select class="form-select" id="tf-status">
               ${['active','at_risk','penalty_risk','complete','cancelled'].map(s=>`<option value="${s}" ${t.status===s?'selected':''}>${s.replace('_',' ')}</option>`).join('')}
@@ -2850,6 +2894,7 @@ pages.tenders = {
       week2_deadline:  document.getElementById('tf-d2').value,
       supply_start:    document.getElementById('tf-ss').value || null,
       supply_end:      document.getElementById('tf-se').value || null,
+      sale_rate_per_qtl: parseFloat(document.getElementById('tf-rate').value) || null,
     };
     try {
       await apiFetch(`/tenders/${id}`, { method: 'PUT', body: JSON.stringify(body) });
@@ -6631,117 +6676,133 @@ pages['busy-staging'] = {
 };
 
 // ============================================================
-// SALES BILLS
-// ============================================================
-pages['sales-bills'] = {
-  query: '',
-  sort: 'date_desc',
-
-  async load() {
-    const el = document.getElementById('page-sales-bills');
-    el.innerHTML = '<div class="loading">Loading</div>';
-    setTopbarActions(`<div style="display:flex;gap:8px;align-items:center">
-      <input id="sales-bills-search" class="form-input" style="width:220px" placeholder="Search SB / plant" value="${escapeHtml(this.query || '')}" oninput="pages['sales-bills'].setQuery(this.value)">
-      <select class="ctx-select" style="min-width:170px" onchange="pages['sales-bills'].setSort(this.value)">
-        <option value="date_desc" ${this.sort==='date_desc'?'selected':''}>Sort: Date newest</option>
-        <option value="date_asc" ${this.sort==='date_asc'?'selected':''}>Sort: Date oldest</option>
-        <option value="total_desc" ${this.sort==='total_desc'?'selected':''}>Sort: Total high-low</option>
-        <option value="total_asc" ${this.sort==='total_asc'?'selected':''}>Sort: Total low-high</option>
-      </select>
-    </div>`, `sales-bills:${this.sort}`);
-    try {
-      const rows = this.filteredAndSortedRows(await apiFetch('/sales-bills'));
-      if (!rows.length) { el.innerHTML = '<div class="loading">No sales bills yet.</div>'; return; }
-      el.innerHTML = `<div class="tbl-wrap">
-        <table class="tbl">
-          <thead><tr>
-            <th>SB no.</th><th>Plant</th><th class="r">Qty (Qtl)</th>
-            <th class="r">Rate</th><th class="r">Total</th><th>Date</th><th>Status</th><th>Busy</th>
-          </tr></thead>
-          <tbody>
-            ${rows.map(s=>`<tr>
-              <td class="num">${s.sb_number||'—'}</td>
-              <td>${s.plant}</td>
-              <td class="num r">${s.qty_mt}</td>
-              <td class="num r">₹${parseFloat(s.rate_per_mt).toLocaleString('en-IN')}</td>
-              <td class="num r">${fmtAmt(s.total_amount)}</td>
-              <td>${s.bill_date}</td>
-              <td>${statusPill(s.status)}</td>
-              <td>${s.busy_exported?'<span class="pill pill-info" style="font-size:9px">Exported</span>':'—'}</td>
-            </tr>`).join('')}
-          </tbody>
-        </table>
-      </div>`;
-    } catch {}
-  }
-,
-  filteredAndSortedRows(rows) {
-    const sortMap = {
-      date_desc: { sortBy: 'bill_date', sortDir: 'desc' },
-      date_asc: { sortBy: 'bill_date', sortDir: 'asc' },
-      total_desc: { sortBy: 'total_amount', sortDir: 'desc' },
-      total_asc: { sortBy: 'total_amount', sortDir: 'asc' },
-    };
-    const sc = sortMap[this.sort] || sortMap.date_desc;
-    return applyFilterSortRows(Array.isArray(rows) ? rows : [], {
-      query: this.query || '',
-      searchFields: ['sb_number', 'plant', 'status'],
-      sortBy: sc.sortBy,
-      sortDir: sc.sortDir,
-      sortGetters: {
-        bill_date: (r) => r?.bill_date || null,
-        total_amount: (r) => Number(r?.total_amount || 0),
-      },
-    });
-  },
-  setQuery(v) { this.query = String(v || ''); this.load(); },
-  setSort(v) { this.sort = String(v || 'date_desc'); this.load(); }
-};
-
-// ============================================================
 // PAYMENTS
 // ============================================================
 pages.payments = {
   query: '',
   sort: 'date_desc',
+  tab: 'due',
+  pickedPays: new Set(),
 
   async load() {
     const el = document.getElementById('page-payments');
     el.innerHTML = '<div class="loading">Loading</div>';
-    setTopbarActions(`<div style="display:flex;gap:8px;align-items:center">
-      <input id="payments-search" class="form-input" style="width:220px" placeholder="Search broker / voucher / ref" value="${escapeHtml(this.query || '')}" oninput="pages.payments.setQuery(this.value)">
-      <select class="ctx-select" style="min-width:170px" onchange="pages.payments.setSort(this.value)">
+    setTopbarActions(this.tab === 'paid' ? `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input id="payments-search" class="form-input" style="width:200px" placeholder="Search broker / voucher / ref" value="${escapeHtml(this.query || '')}" oninput="pages.payments.setQuery(this.value)">
+      <select class="ctx-select" style="min-width:160px" onchange="pages.payments.setSort(this.value)">
         <option value="date_desc" ${this.sort==='date_desc'?'selected':''}>Sort: Date newest</option>
         <option value="date_asc" ${this.sort==='date_asc'?'selected':''}>Sort: Date oldest</option>
         <option value="amount_desc" ${this.sort==='amount_desc'?'selected':''}>Sort: Amount high-low</option>
         <option value="amount_asc" ${this.sort==='amount_asc'?'selected':''}>Sort: Amount low-high</option>
       </select>
-    </div>`, `payments:${this.sort}`);
+      <button class="btn btn-primary" onclick="pages.payments.exportBusy()">Export selected to Busy</button>
+    </div>` : '', `payments:${this.tab}:${this.sort}`);
+    const seg = `<div class="seg">
+      <button class="${this.tab==='due'?'on':''}" onclick="pages.payments.setTab('due')">Due to pay</button>
+      <button class="${this.tab==='paid'?'on':''}" onclick="pages.payments.setTab('paid')">Payment vouchers</button>
+    </div>`;
     try {
-      const paysRaw = await apiFetch('/payments');
-      const pays = this.filteredAndSortedRows(paysRaw);
-      if (!pays.length) { el.innerHTML = '<div class="loading">No payments yet.</div>'; return; }
-      el.innerHTML = `<div class="tbl-wrap">
+      el.innerHTML = seg + (this.tab === 'due' ? await this.renderDue() : await this.renderPaid());
+    } catch (e) { el.innerHTML = seg + `<div class="loading">${escapeHtml(e.message || 'Could not load')}</div>`; }
+  },
+
+  setTab(t) { this.tab = t; this.load(); },
+
+  async renderDue() {
+    const rows = await apiFetch('/payments/due');
+    if (!rows.length) return '<div class="loading">Nothing due. Bills become payable once the plant unloading result is in.</div>';
+    return `<div style="margin-bottom:10px;color:var(--muted);font-size:12px">Payable = plant-accepted qty × deal rate. Bills still waiting for unloading are not listed.</div>
+      <div class="tbl-wrap"><table class="tbl"><thead><tr><th>PB no.</th><th>Broker</th><th>Bill / truck</th>
+        <th class="r">Billed</th><th class="r">Accepted</th><th class="r">Deal rate</th><th class="r">Payable</th><th class="r">Paid</th><th class="r">Due</th><th></th></tr></thead>
+      <tbody>${rows.map(r => `<tr>
+        <td class="num">${escapeHtml(r.pb_number || '—')}</td>
+        <td>${escapeHtml(r.broker || '—')}</td>
+        <td class="num" style="font-size:11px">${escapeHtml(r.bill_number || '')}<div style="color:var(--muted)">${escapeHtml(r.vehicle_number || '')}</div></td>
+        <td class="num r">${r.billed_qty_qtl ?? '—'}</td>
+        <td class="num r">${r.accepted_qty_qtl}</td>
+        <td class="num r">₹${Number(r.deal_rate_per_qtl).toLocaleString('en-IN')}</td>
+        <td class="num r">${fmtAmt(r.payable)}</td>
+        <td class="num r">${fmtAmt(r.paid_amount)}</td>
+        <td class="num r">${r.payment_state === 'overpaid' ? `<span class="pill pill-danger">recover ${fmtAmt(r.paid_amount - r.payable)}</span>` : fmtAmt(r.outstanding)}</td>
+        <td>${r.outstanding > 0.5 ? `<button class="btn btn-xs btn-success" onclick="pages.payments.pay(${r.purchase_bill_id}, ${r.outstanding})">Pay</button>` : ''}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+  },
+
+  pay(id, amount) {
+    modal(`<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+      <div class="modal">
+        <div class="modal-head">Record payment <button class="btn btn-sm" onclick="closeModal()">✕</button></div>
+        <div class="modal-body">
+          <div class="form-row">
+            <div class="form-field"><div class="form-label">Amount (due ₹${Number(amount||0).toLocaleString('en-IN')})</div><input class="form-input" id="pd-amt" type="number" value="${amount}" max="${amount}"></div>
+            <div class="form-field"><div class="form-label">Date</div><input class="form-input" id="pd-date" type="date" value="${new Date().toISOString().slice(0,10)}"></div>
+          </div>
+          <div class="form-row">
+            <div class="form-field"><div class="form-label">Mode</div>
+              <select class="form-select" id="pd-mode"><option>neft</option><option>rtgs</option><option>upi</option><option>cheque</option><option>cash</option></select>
+            </div>
+            <div class="form-field"><div class="form-label">Ref no. / UTR</div><input class="form-input" id="pd-ref"></div>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" onclick="closeModal()">Cancel</button>
+          <button class="btn btn-success" onclick="pages.payments.savePay(${id})">Confirm payment</button>
+        </div>
+      </div>
+    </div>`);
+  },
+
+  async savePay(id) {
+    try {
+      await apiPost('/payments', {
+        purchase_bill_id: id,
+        amount: parseFloat(document.getElementById('pd-amt').value),
+        payment_date: document.getElementById('pd-date').value,
+        payment_mode: document.getElementById('pd-mode').value,
+        reference_no: document.getElementById('pd-ref').value || null,
+      });
+      closeModal(); toast('Payment recorded', 'ok');
+      this.load();
+    } catch {}
+  },
+
+  async renderPaid() {
+    const pays = this.filteredAndSortedRows(await apiFetch('/payments'));
+    if (!pays.length) return '<div class="loading">No payments yet.</div>';
+    return `<div class="tbl-wrap">
         <table class="tbl">
           <thead><tr>
-            <th>Voucher no.</th><th>Broker</th><th class="r">Amount</th>
-            <th>Date</th><th>Mode</th><th>Ref no.</th><th>Status</th><th>Busy</th><th></th>
+            <th></th><th>Voucher no.</th><th>Broker</th><th class="r">Amount</th>
+            <th>Date</th><th>Mode</th><th>Ref no.</th><th>Status</th><th>Busy</th>
           </tr></thead>
           <tbody>
             ${pays.map(p=>`<tr>
+              <td><input type="checkbox" ${this.pickedPays.has(p.id)?'checked':''} onchange="pages.payments.togglePay(${p.id}, this.checked)"></td>
               <td class="num">${p.voucher_number||'—'}</td>
-              <td>${p.broker}</td>
+              <td>${escapeHtml(p.broker||'')}</td>
               <td class="num r">${fmtAmt(p.amount)}</td>
               <td>${p.payment_date||'—'}</td>
               <td><span class="pill pill-muted">${(p.payment_mode||'').toUpperCase()}</span></td>
-              <td class="num" style="color:var(--muted)">${p.reference_no||'—'}</td>
+              <td class="num" style="color:var(--muted)">${escapeHtml(p.reference_no||'—')}</td>
               <td>${statusPill(p.status)}</td>
-              <td>${p.busy_exported?'<span class="pill pill-info" style="font-size:9px">Exported</span>':'<button class="btn btn-xs" onclick="toast(\'Export to Busy\')">Export</button>'}</td>
+              <td>${p.busy_exported?'<span class="pill pill-info" style="font-size:9px">Exported</span>':'—'}</td>
             </tr>`).join('')}
           </tbody>
         </table>
       </div>`;
-    } catch {}
+  },
+
+  togglePay(id, on) { on ? this.pickedPays.add(id) : this.pickedPays.delete(id); },
+
+  async exportBusy() {
+    const ids = [...this.pickedPays];
+    if (!ids.length) return toast('Tick the payments to export', 'warn');
+    try {
+      await downloadPost('/export/payments/busy-xlsx', { ids }, 'busy_payment_vouchers.xlsx');
+      this.pickedPays = new Set();
+      toast(`Exported ${ids.length} payment vouchers for Busy`, 'ok');
+      this.load();
+    } catch (e) { toast(e.message, 'err'); }
   }
 ,
   filteredAndSortedRows(rows) {
@@ -7718,7 +7779,7 @@ pages.whatsapp = {
       const statusPill = log.status === 'processed'
         ? '<span class="pill pill-active">PROCESSED</span>'
         : log.status === 'approved'
-          ? '<span class="pill pill-success">APPROVED</span>'
+          ? '<span class="pill pill-active">APPROVED</span>'
           : log.status === 'flagged'
             ? '<span class="pill pill-danger">FLAGGED</span>'
             : '<span class="pill pill-pending">PENDING</span>';
@@ -8209,9 +8270,443 @@ pages.whatsapp = {
   }
 };
 
+// ============================================================
+// LOGIN
+// ============================================================
+const auth = {
+  me: null,
+  firstAdmin: false,
+
+  async init() {
+    let info;
+    try {
+      const r = await fetch(`${API}/auth/me`);
+      info = await r.json();
+    } catch { return true; }               // server unreachable: let pages show their own errors
+    if (!info.auth_enabled) return true;
+    if (info.user) { this.setUser(info.user); return true; }
+    this.firstAdmin = !!info.needs_first_admin;
+    this.show();
+    return false;
+  },
+
+  setUser(u) {
+    this.me = u;
+    const chip = document.getElementById('user-chip');
+    if (chip) chip.style.display = 'flex';
+    const nm = document.getElementById('user-chip-name');
+    if (nm) nm.textContent = `${u.full_name || u.username} · ${u.role}`;
+    const navUsers = document.getElementById('nav-users');
+    if (navUsers) navUsers.style.display = u.role === 'admin' ? '' : 'none';
+  },
+
+  show() {
+    const el = document.getElementById('login-screen');
+    if (!el || el.classList.contains('show')) return;
+    document.getElementById('login-sub').textContent = this.firstAdmin
+      ? 'First time: create the admin login' : 'Log in to continue';
+    document.getElementById('login-name-field').style.display = this.firstAdmin ? '' : 'none';
+    document.getElementById('login-btn').textContent = this.firstAdmin ? 'Create admin and log in' : 'Log in';
+    document.getElementById('login-pass').autocomplete = this.firstAdmin ? 'new-password' : 'current-password';
+    el.classList.add('show');
+    setTimeout(() => document.getElementById('login-user')?.focus(), 50);
+  },
+
+  async submit() {
+    const err = document.getElementById('login-err');
+    err.textContent = '';
+    const body = {
+      username: document.getElementById('login-user').value.trim(),
+      password: document.getElementById('login-pass').value,
+    };
+    if (this.firstAdmin) body.full_name = document.getElementById('login-fullname').value.trim() || null;
+    try {
+      const r = await fetch(`${API}/auth/${this.firstAdmin ? 'bootstrap' : 'login'}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) { err.textContent = (data && data.detail) || 'Login failed'; return; }
+      window.location.reload();
+    } catch (e) { err.textContent = 'Cannot reach the server'; }
+  },
+
+  async logout() {
+    try { await fetch(`${API}/auth/logout`, { method: 'POST' }); } catch {}
+    window.location.reload();
+  },
+
+  openPassword() {
+    modal(`<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+      <div class="modal">
+        <div class="modal-head">Change password <button class="btn btn-sm" onclick="closeModal()">✕</button></div>
+        <div class="modal-body">
+          <div class="form-field"><div class="form-label">Current password</div><input class="form-input" id="pw-cur" type="password" autocomplete="current-password"></div>
+          <div class="form-field"><div class="form-label">New password (8+ characters)</div><input class="form-input" id="pw-new" type="password" autocomplete="new-password"></div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" onclick="closeModal()">Cancel</button>
+          <button class="btn btn-primary" onclick="auth.savePassword()">Save</button>
+        </div>
+      </div></div>`);
+  },
+
+  async savePassword() {
+    try {
+      await apiFetchRaw('/auth/password', { method: 'POST', body: JSON.stringify({
+        current_password: document.getElementById('pw-cur').value,
+        new_password: document.getElementById('pw-new').value,
+      }) });
+      closeModal(); toast('Password changed', 'ok');
+    } catch {}
+  },
+};
+
+function errorText(raw) {
+  try {
+    const j = JSON.parse(raw);
+    const d = j.detail;
+    if (typeof d === 'string') return d;
+    if (d && d.message) return d.message;
+    return raw;
+  } catch { return raw; }
+}
+
+async function downloadPost(path, body, fallbackName) {
+  const res = await fetch(API + withContext(path), {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (res.status === 401) { auth.show(); throw new Error('Please log in'); }
+  if (!res.ok) throw new Error(errorText(await res.text()) || 'Download failed');
+  const blob = await res.blob();
+  const m = (res.headers.get('Content-Disposition') || '').match(/filename=([^;]+)/i);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = m ? m[1].replace(/"/g, '').trim() : fallbackName;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
+// ============================================================
+// SALES BILLS (built from plant-unloaded lines)
+// ============================================================
+pages['sales-bills'] = {
+  query: '',
+  sort: 'date_desc',
+  tab: 'make',
+  lines: [],
+  picked: new Set(),
+  pickedBills: new Set(),
+
+  async load() {
+    const el = document.getElementById('page-sales-bills');
+    el.innerHTML = '<div class="loading">Loading</div>';
+    setTopbarActions(this.tab === 'list' ? `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input id="sales-bills-search" class="form-input" style="width:200px" placeholder="Search SB / plant" value="${escapeHtml(this.query || '')}" oninput="pages['sales-bills'].setQuery(this.value)">
+      <select class="ctx-select" style="min-width:160px" onchange="pages['sales-bills'].setSort(this.value)">
+        <option value="date_desc" ${this.sort==='date_desc'?'selected':''}>Sort: Date newest</option>
+        <option value="date_asc" ${this.sort==='date_asc'?'selected':''}>Sort: Date oldest</option>
+        <option value="total_desc" ${this.sort==='total_desc'?'selected':''}>Sort: Total high-low</option>
+        <option value="total_asc" ${this.sort==='total_asc'?'selected':''}>Sort: Total low-high</option>
+      </select>
+      <button class="btn btn-primary" onclick="pages['sales-bills'].exportBusy()">Export selected to Busy</button>
+    </div>` : '', `sales-bills:${this.tab}:${this.sort}`);
+    const seg = `<div class="seg">
+      <button class="${this.tab==='make'?'on':''}" onclick="pages['sales-bills'].setTab('make')">Make sales bill</button>
+      <button class="${this.tab==='list'?'on':''}" onclick="pages['sales-bills'].setTab('list')">Sales bills</button>
+    </div>`;
+    try {
+      el.innerHTML = seg + (this.tab === 'make' ? await this.renderMake() : await this.renderList());
+    } catch (e) { el.innerHTML = seg + `<div class="loading">${escapeHtml(e.message || 'Could not load')}</div>`; }
+  },
+
+  setTab(t) { this.tab = t; this.load(); },
+
+  async renderMake(refetch = true) {
+    if (refetch || !this.lines) this.lines = await apiFetch('/sales-bills/billable-lines');
+    const valid = new Set(this.lines.filter(l => l.billable).map(l => l.receipt_id));
+    this.picked = new Set([...this.picked].filter(id => valid.has(id)));
+    if (!this.lines.length) return '<div class="loading">No unloaded lines waiting for a sales bill. Lines appear here once the plant unloading is approved.</div>';
+    const groups = {};
+    this.lines.forEach(l => { (groups[`${l.company_id}|${l.plant_id}`] ||= []).push(l); });
+    const firmName = id => (state.companies || []).find(c => String(c.id) === String(id))?.name || 'Firm not set';
+    const sel = this.selectionSummary();
+    return `<div style="margin-bottom:10px;color:var(--muted);font-size:12px">Tick the trucks to put on one bill (one firm, one plant). Quantity is what the plant accepted; rate is from the PO.</div>
+      <div class="tbl-wrap" style="padding:10px 14px;margin-bottom:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <span><b>${sel.count}</b> trucks · <b>${sel.qty.toLocaleString('en-IN')}</b> qtl · <b>${fmtAmt(sel.amount)}</b></span>
+        <input class="form-input" type="date" id="sb-date" style="width:150px" value="${new Date().toISOString().slice(0,10)}">
+        <input class="form-input" id="sb-no" style="width:150px" placeholder="Bill no. (auto)">
+        <button class="btn btn-primary" ${sel.count ? '' : 'disabled'} onclick="pages['sales-bills'].create()">Create sales bill</button>
+        ${sel.count ? `<button class="btn btn-sm" onclick="pages['sales-bills'].clearPick()">Clear</button>` : ''}
+      </div>
+      ${Object.entries(groups).map(([key, rows]) => `<div class="tbl-wrap" style="margin-bottom:14px">
+        <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <b>${escapeHtml(rows[0].plant || 'Plant')}</b><span style="color:var(--muted)">${escapeHtml(firmName(rows[0].company_id))}</span>
+          <button class="btn btn-xs" onclick="pages['sales-bills'].pickGroup('${key}')">Tick all billable</button>
+        </div>
+        <table class="tbl"><thead><tr><th></th><th>Truck</th><th>Unloaded</th><th>Tender</th><th>Material</th>
+          <th class="r">Accepted (qtl)</th><th class="r">Rate</th><th class="r">Amount</th><th></th></tr></thead>
+        <tbody>${rows.map(l => `<tr>
+          <td>${l.billable ? `<input type="checkbox" ${this.picked.has(l.receipt_id)?'checked':''} onchange="pages['sales-bills'].toggle(${l.receipt_id}, this.checked)">` : ''}</td>
+          <td class="num">${escapeHtml(l.vehicle_number || '—')}</td>
+          <td>${l.receipt_date || '—'}</td>
+          <td>${escapeHtml(l.tender_number || '—')}</td>
+          <td>${escapeHtml(l.material || '—')}</td>
+          <td class="num r">${l.accepted_qtl}${l.rejected_qtl ? ` <span style="color:var(--muted)">(-${l.rejected_qtl})</span>` : ''}</td>
+          <td class="num r">${l.sale_rate_per_qtl != null ? '₹' + Number(l.sale_rate_per_qtl).toLocaleString('en-IN') : '—'}</td>
+          <td class="num r">${l.amount != null ? fmtAmt(l.amount) : '—'}</td>
+          <td>${l.billable ? '' : `<span class="pill pill-pending" style="font-size:9px">${escapeHtml(l.problems.join(', '))}</span>`}</td>
+        </tr>`).join('')}</tbody></table></div>`).join('')}`;
+  },
+
+  selectionSummary() {
+    const rows = this.lines.filter(l => this.picked.has(l.receipt_id));
+    return { count: rows.length, qty: Math.round(rows.reduce((a, l) => a + l.accepted_qtl, 0) * 1000) / 1000,
+             amount: rows.reduce((a, l) => a + (l.amount || 0), 0), rows };
+  },
+
+  toggle(id, on) {
+    const line = this.lines.find(l => l.receipt_id === id);
+    const first = this.selectionSummary().rows[0];
+    if (on && first && (first.company_id !== line.company_id || first.plant_id !== line.plant_id)) {
+      toast('One sales bill is for one firm and one plant', 'warn');
+      this.redrawMake();
+      return;
+    }
+    on ? this.picked.add(id) : this.picked.delete(id);
+    this.redrawMake();
+  },
+
+  async redrawMake() {
+    const el = document.getElementById('page-sales-bills');
+    const y = el.scrollTop;
+    const seg = el.querySelector('.seg')?.outerHTML || '';
+    el.innerHTML = seg + await this.renderMake(false);
+    el.scrollTop = y;
+  },
+
+  pickGroup(key) {
+    const rows = this.lines.filter(l => `${l.company_id}|${l.plant_id}` === key && l.billable);
+    const first = this.selectionSummary().rows[0];
+    if (first && `${first.company_id}|${first.plant_id}` !== key) this.picked = new Set();
+    rows.forEach(l => this.picked.add(l.receipt_id));
+    this.redrawMake();
+  },
+
+  clearPick() { this.picked = new Set(); this.redrawMake(); },
+
+  async create() {
+    const sel = this.selectionSummary();
+    if (!sel.count) return;
+    if (!confirm(`Create one sales bill for ${sel.count} trucks, ${sel.qty} qtl, ${fmtAmt(sel.amount)}?`)) return;
+    try {
+      const sb = await apiPost('/sales-bills', {
+        receipt_ids: [...this.picked],
+        bill_date: document.getElementById('sb-date')?.value || null,
+        sb_number: (document.getElementById('sb-no')?.value || '').trim() || null,
+      });
+      this.picked = new Set();
+      toast(`Sales bill ${sb.sb_number} created`, 'ok');
+      this.tab = 'list';
+      this.load();
+    } catch (e) { toast(errorText(e.message), 'err'); }
+  },
+
+  async renderList() {
+    const rows = this.filteredAndSortedRows(await apiFetch('/sales-bills'));
+    if (!rows.length) return '<div class="loading">No sales bills yet.</div>';
+    return `<div class="tbl-wrap"><table class="tbl">
+      <thead><tr><th></th><th>SB no.</th><th>Plant</th><th class="r">Trucks</th><th class="r">Qty (Qtl)</th>
+        <th class="r">Rate</th><th class="r">Total</th><th>Date</th><th>Status</th><th>Busy</th><th></th></tr></thead>
+      <tbody>${rows.map(s => `<tr>
+        <td>${s.status !== 'cancelled' ? `<input type="checkbox" ${this.pickedBills.has(s.id)?'checked':''} onchange="pages['sales-bills'].toggleBill(${s.id}, this.checked)">` : ''}</td>
+        <td class="num"><a href="#" style="color:var(--accent)" onclick="event.preventDefault();pages['sales-bills'].view(${s.id})">${escapeHtml(s.sb_number || '—')}</a></td>
+        <td>${escapeHtml(s.plant || '—')}</td>
+        <td class="num r">${s.line_count}</td>
+        <td class="num r">${s.qty_mt}</td>
+        <td class="num r">₹${Number(s.rate_per_mt).toLocaleString('en-IN')}</td>
+        <td class="num r">${fmtAmt(s.total_amount)}</td>
+        <td>${s.bill_date}</td>
+        <td>${statusPill(s.status)}${s.lines_changed_since_billing.length ? ' <span class="pill pill-pending" style="font-size:9px">plant qty changed</span>' : ''}</td>
+        <td>${s.busy_exported ? '<span class="pill pill-info" style="font-size:9px">Exported</span>' : '—'}</td>
+        <td>${s.status !== 'cancelled' && s.status !== 'paid' ? `<button class="btn btn-xs" onclick="pages['sales-bills'].cancel(${s.id}, ${s.busy_exported})">Cancel</button>` : ''}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+  },
+
+  toggleBill(id, on) { on ? this.pickedBills.add(id) : this.pickedBills.delete(id); },
+
+  async view(id) {
+    try {
+      const s = await apiFetch(`/sales-bills/${id}`);
+      modal(`<div class="modal-overlay" onclick="if(event.target===this)closeModal()"><div class="modal" style="max-width:760px">
+        <div class="modal-head">${escapeHtml(s.sb_number)} · ${escapeHtml(s.plant || '')} <button class="btn btn-sm" onclick="closeModal()">✕</button></div>
+        <div class="modal-body">
+          <div style="color:var(--muted);font-size:12px;margin-bottom:8px">${escapeHtml(s.company || '')} · Busy party: ${escapeHtml(s.party_name || '')} · ${s.bill_date}</div>
+          <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Truck</th><th>Unloaded</th><th>Material</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th><th></th></tr></thead>
+          <tbody>${s.lines.map(l => `<tr><td class="num">${escapeHtml(l.vehicle_number || '')}</td><td>${l.receipt_date || ''}</td><td>${escapeHtml(l.material || '')}</td>
+            <td class="num r">${l.qty_qtl}</td><td class="num r">₹${l.rate_per_qtl}</td><td class="num r">${fmtAmt(l.amount)}</td>
+            <td>${l.changed_since_billing ? `<span class="pill pill-pending" style="font-size:9px">plant now ${l.plant_accepted_now_qtl}</span>` : ''}</td></tr>`).join('')}
+          <tr><td colspan="3"><b>Total</b></td><td class="num r"><b>${s.qty_mt}</b></td><td></td><td class="num r"><b>${fmtAmt(s.total_amount)}</b></td><td></td></tr></tbody></table></div>
+        </div>
+        <div class="modal-foot"><button class="btn" onclick="closeModal()">Close</button></div></div></div>`);
+    } catch {}
+  },
+
+  async cancel(id, exported) {
+    const msg = exported ? 'This bill is already in Busy. Cancel it here and also cancel it in Busy?' : 'Cancel this sales bill? Its trucks go back to the list.';
+    if (!confirm(msg)) return;
+    try {
+      const r = await apiPost(`/sales-bills/${id}/cancel`, {});
+      toast(r.warning || 'Sales bill cancelled', r.warning ? 'warn' : 'ok');
+      this.load();
+    } catch {}
+  },
+
+  async exportBusy() {
+    const ids = [...this.pickedBills];
+    if (!ids.length) return toast('Tick the sales bills to export', 'warn');
+    try {
+      await downloadPost('/export/sales-bills/busy-xlsx', { ids }, 'busy_sales_bills.xlsx');
+      this.pickedBills = new Set();
+      toast(`Exported ${ids.length} sales bills for Busy`, 'ok');
+      this.load();
+    } catch (e) { toast(e.message, 'err'); }
+  },
+
+  filteredAndSortedRows(rows) {
+    const sortMap = {
+      date_desc: { sortBy: 'bill_date', sortDir: 'desc' },
+      date_asc: { sortBy: 'bill_date', sortDir: 'asc' },
+      total_desc: { sortBy: 'total_amount', sortDir: 'desc' },
+      total_asc: { sortBy: 'total_amount', sortDir: 'asc' },
+    };
+    const sc = sortMap[this.sort] || sortMap.date_desc;
+    return applyFilterSortRows(Array.isArray(rows) ? rows : [], {
+      query: this.query || '',
+      searchFields: ['sb_number', 'plant', 'status'],
+      sortBy: sc.sortBy,
+      sortDir: sc.sortDir,
+      sortGetters: {
+        bill_date: (r) => r?.bill_date || null,
+        total_amount: (r) => Number(r?.total_amount || 0),
+      },
+    });
+  },
+  setQuery(v) { this.query = String(v || ''); this.load(); },
+  setSort(v) { this.sort = String(v || 'date_desc'); this.load(); }
+};
+
+// ============================================================
+// AUTO-APPROVAL (shadow mode scorecard)
+// ============================================================
+pages['auto-approval'] = {
+  async load() {
+    const el = document.getElementById('page-auto-approval');
+    el.innerHTML = '<div class="loading">Loading</div>';
+    setTopbarActions(`<button class="btn btn-primary" onclick="pages['auto-approval'].run()">Check pending bills now</button>`, 'auto-approval');
+    try {
+      const [rep, decs] = await Promise.all([apiFetch('/auto-approval/report'), apiFetch('/auto-approval/decisions?limit=100')]);
+      const modeText = { shadow: 'Shadow mode: decisions are only recorded, nothing is approved automatically.',
+                         live: 'Live: bills that pass every check are approved automatically.', off: 'Off.' }[rep.mode] || rep.mode;
+      const card = (label, v) => `<div class="tbl-wrap" style="padding:12px 14px;min-width:130px"><div style="color:var(--muted);font-size:11px">${label}</div><div class="num" style="font-size:20px">${v}</div></div>`;
+      el.innerHTML = `<div style="margin-bottom:10px">${statusPill(rep.mode)} <span style="color:var(--muted);font-size:12px">${modeText}</span></div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+          ${card('Bills checked', rep.decisions)}${card('Would approve', rep.would_approve)}${card('Would hold', rep.would_hold)}
+          ${card('Agreed with you', rep.approve_agreed)}${card('Wrong approvals', rep.approve_wrong)}
+          ${card('Accuracy', rep.approve_accuracy == null ? '—' : Math.round(rep.approve_accuracy * 100) + '%')}
+        </div>
+        <div class="tbl-wrap" style="padding:10px 14px;margin-bottom:12px;font-size:12px">${escapeHtml(rep.advice)}
+          ${rep.most_failed_checks.length ? `<div style="color:var(--muted);margin-top:6px">Most common reasons to hold: ${rep.most_failed_checks.map(([n, c]) => `${escapeHtml(n)} (${c})`).join(', ')}</div>` : ''}</div>
+        ${decs.length ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Bill</th><th>Seller</th><th>Truck</th><th class="r">Amount</th><th>Decision</th><th>Failed checks</th><th>What you did</th></tr></thead>
+        <tbody>${decs.map(d => `<tr>
+          <td class="num">${escapeHtml(d.bill_number || d.file_name || '#' + d.pending_ingest_id)}</td>
+          <td>${escapeHtml(d.vendor || '—')}</td><td class="num">${escapeHtml(d.vehicle_number || '—')}</td>
+          <td class="num r">${fmtAmt(d.total_amount)}</td>
+          <td>${d.would_approve ? '<span class="pill pill-active">approve</span>' : '<span class="pill pill-pending">hold</span>'}${d.acted ? ' <span class="pill pill-info" style="font-size:9px">done</span>' : ''}</td>
+          <td style="font-size:11px">${d.failed_checks.map(c => escapeHtml(c)).join(', ') || '—'}</td>
+          <td style="font-size:11px">${escapeHtml(d.outcome.human)}${d.outcome.agrees === false ? ' <span class="pill pill-danger" style="font-size:9px">disagree</span>' : ''}<div style="color:var(--muted)">${escapeHtml(d.outcome.why || '')}</div></td>
+        </tr>`).join('')}</tbody></table></div>` : '<div class="loading">No bills checked yet.</div>'}`;
+    } catch {}
+  },
+
+  async run() {
+    try {
+      const r = await apiPost('/auto-approval/run?force=true', {});
+      toast(`Checked ${r.evaluated} bills, ${r.would_approve} pass every check`, 'ok');
+      this.load();
+    } catch {}
+  },
+};
+
+// ============================================================
+// USERS (admin)
+// ============================================================
+pages.users = {
+  async load() {
+    const el = document.getElementById('page-users');
+    el.innerHTML = '<div class="loading">Loading</div>';
+    setTopbarActions(`<button class="btn btn-primary" onclick="pages.users.openAdd()">+ Add user</button>`, 'users');
+    try {
+      const users = await apiFetchRaw('/auth/users');
+      el.innerHTML = `<div style="color:var(--muted);font-size:12px;margin-bottom:10px">Admin: everything. Accountant: bills, payments, sales bills, Busy. Operator: upload and review documents, plant unloading. Viewer: read only.</div>
+        <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th>Last login</th><th></th></tr></thead>
+        <tbody>${users.map(u => `<tr>
+          <td class="num">${escapeHtml(u.username)}</td><td>${escapeHtml(u.full_name || '—')}</td>
+          <td><select class="form-select" style="min-width:120px" onchange="pages.users.update(${u.id}, {role: this.value})">
+            ${['admin','accountant','operator','viewer'].map(r => `<option ${r===u.role?'selected':''}>${r}</option>`).join('')}</select></td>
+          <td>${u.is_active ? '<span class="pill pill-active">active</span>' : '<span class="pill pill-muted">off</span>'}</td>
+          <td>${u.last_login_at ? escapeHtml(u.last_login_at.slice(0,16)) : '—'}</td>
+          <td style="white-space:nowrap"><button class="btn btn-xs" onclick="pages.users.resetPw(${u.id})">Reset password</button>
+            <button class="btn btn-xs" onclick="pages.users.update(${u.id}, {is_active: ${!u.is_active}})">${u.is_active ? 'Turn off' : 'Turn on'}</button></td>
+        </tr>`).join('')}</tbody></table></div>`;
+    } catch {}
+  },
+
+  openAdd() {
+    modal(`<div class="modal-overlay" onclick="if(event.target===this)closeModal()"><div class="modal">
+      <div class="modal-head">Add user <button class="btn btn-sm" onclick="closeModal()">✕</button></div>
+      <div class="modal-body">
+        <div class="form-row">
+          <div class="form-field"><div class="form-label">Username</div><input class="form-input" id="nu-user" autocapitalize="none"></div>
+          <div class="form-field"><div class="form-label">Name</div><input class="form-input" id="nu-name"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-field"><div class="form-label">Password (8+ characters)</div><input class="form-input" id="nu-pass" type="password" autocomplete="new-password"></div>
+          <div class="form-field"><div class="form-label">Role</div><select class="form-select" id="nu-role"><option>operator</option><option>accountant</option><option>viewer</option><option>admin</option></select></div>
+        </div>
+      </div>
+      <div class="modal-foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="pages.users.add()">Add</button></div>
+    </div></div>`);
+  },
+
+  async add() {
+    try {
+      await apiFetchRaw('/auth/users', { method: 'POST', body: JSON.stringify({
+        username: document.getElementById('nu-user').value.trim(),
+        full_name: document.getElementById('nu-name').value.trim() || null,
+        password: document.getElementById('nu-pass').value,
+        role: document.getElementById('nu-role').value,
+      }) });
+      closeModal(); toast('User added', 'ok'); this.load();
+    } catch {}
+  },
+
+  async update(id, body) {
+    try { await apiFetchRaw(`/auth/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) }); toast('Saved', 'ok'); } catch {}
+    this.load();
+  },
+
+  async resetPw(id) {
+    const pw = prompt('New password for this user (8+ characters). They will be logged out.');
+    if (pw) this.update(id, { password: pw });
+  },
+};
+
 // ── Boot ───────────────────────────────────────────────────────────────────
 (async () => {
   loadContextFromStorage();
+  if (!(await auth.init())) return;   // login screen shown; boot resumes after login
   await loadRef();
   await refreshPendingIngestBadge();
   if (canAccessWorkspace('dashboard')) {

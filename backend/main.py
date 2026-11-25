@@ -3371,6 +3371,13 @@ def _match_receipt_to_dispatch(db: Session, r: PlantReceipt, manual: bool = Fals
         r.matched_dispatch_id = d.id
         r.match_status = "auto"
         r.match_reason = "Auto-matched on truck + plant + material"
+        # The truck's firm/tender come from our dispatch (needed for sales bills).
+        if r.company_id is None:
+            r.company_id = d.company_id
+        if r.main_tender_id is None:
+            r.main_tender_id = d.main_tender_id
+        if r.tender_id is None:
+            r.tender_id = d.tender_id
         return d.id
     if len(filtered) > 1:
         r.match_status = "ambiguous"

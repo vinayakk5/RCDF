@@ -165,6 +165,19 @@ class SalesBillTests(SalesCase):
         self.assertEqual(sb.status, m.SalesBillStatus.sent)
 
 
+class ReceiptLineageTests(SalesCase):
+    def test_receipt_matched_to_our_dispatch_is_billable_for_that_firm(self):
+        b = self.make_bill(qty=300)
+        self.approve(b)
+        self.add_receipt(b.vehicle_number, accepted=290, rejected=10)
+        lines = sbs.list_billable_lines(self.db, company_id=self.company.id)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0]["billable"], lines[0]["problems"])
+        self.assertTrue(lines[0]["matched_to_our_dispatch"])
+        sb = sbs.create_sales_bill(self.db, [lines[0]["receipt_id"]])
+        self.assertEqual(float(sb.qty_mt), 290)
+
+
 class PaymentDueAndExportTests(SalesCase):
     def test_due_list_and_payment_export(self):
         b = self.make_bill(qty=300, rate=2550)

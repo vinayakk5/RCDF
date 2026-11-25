@@ -19,7 +19,7 @@ import re
 from datetime import date, datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from models import (
@@ -119,7 +119,22 @@ def billed_receipt_ids(db: Session, receipt_ids: Optional[Iterable[int]] = None)
     return {ln.receipt_id: ln for ln in db.execute(q).scalars().all()}
 
 
+def _fill_lineage_from_dispatch(r: PlantReceipt) -> None:
+    """Older receipts matched to our dispatch may lack firm/tender; take them from it."""
+    d = r.dispatch
+    if d is None:
+        return
+    if r.company_id is None:
+        r.company_id = d.company_id
+    if r.main_tender_id is None:
+        r.main_tender_id = d.main_tender_id
+    if r.tender_id is None and d.tender_id is not None:
+        r.tender_id = d.tender_id
+        r.tender = d.tender
+
+
 def _receipt_line_view(db: Session, r: PlantReceipt, rate_cache: dict) -> dict:
+    _fill_lineage_from_dispatch(r)
     t = r.tender
     if t is not None and t.id not in rate_cache:
         rate_cache[t.id] = tender_sale_rate(db, t)
@@ -165,14 +180,15 @@ def list_billable_lines(db: Session, company_id: Optional[int] = None, plant_id:
     q = (select(PlantReceipt)
          .where(PlantReceipt.is_deleted == False)  # noqa: E712
          .order_by(PlantReceipt.receipt_date, PlantReceipt.id))
-    if company_id is not None:
-        q = q.where(PlantReceipt.company_id == company_id)
+    # Rows with no firm/tender yet may get it from their dispatch, so keep them in
+    # the SQL filter and check again after filling.
+    scope = {"company_id": company_id, "tender_id": tender_id, "main_tender_id": main_tender_id}
+    for col, val in scope.items():
+        if val is not None:
+            c = getattr(PlantReceipt, col)
+            q = q.where(or_(c == val, c == None))  # noqa: E711
     if plant_id is not None:
         q = q.where(PlantReceipt.plant_id == plant_id)
-    if tender_id is not None:
-        q = q.where(PlantReceipt.tender_id == tender_id)
-    if main_tender_id is not None:
-        q = q.where(PlantReceipt.main_tender_id == main_tender_id)
     receipts = db.execute(q).scalars().all()
     billed = billed_receipt_ids(db, [r.id for r in receipts])
     cache: dict = {}
@@ -182,6 +198,9 @@ def list_billable_lines(db: Session, company_id: Optional[int] = None, plant_id:
             continue
         if float(r.accepted_mt or 0) <= 0:
             continue   # fully rejected trucks are never billed
+        _fill_lineage_from_dispatch(r)
+        if any(val is not None and getattr(r, col) != val for col, val in scope.items()):
+            continue
         row = _receipt_line_view(db, r, cache)
         if row["billable"] or include_unbillable:
             out.append(row)
