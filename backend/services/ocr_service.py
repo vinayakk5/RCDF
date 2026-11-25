@@ -608,29 +608,40 @@ Rules:
 """
 
 REJECTION_NOTICE_PROMPT = """
-You are reading a plant rejection notice/letter for a received truck of raw material that failed quality checks.
-Return ONLY one valid JSON object.
+You are reading a rejection letter from an RCDF Cattle Feed Plant (Rajasthan) to a raw material supplier.
+Letters may be in English or Hindi (e.g. "अस्वीकृत" = rejected, "वाहन संख्या" = truck number,
+"आर.एम. नम्बर" = RM number, "प्राप्ति दिनांक" = date received, "मक्का" = Maize).
+A letter can list ONE OR SEVERAL trucks in a table. Return ONLY one valid JSON object:
 
 {
     "document_type": "rejection_notice",
-    "tender_rm_number": "RM/Tender reference if visible (e.g., against RM-828)",
-    "vendor_name": "Supplier/party name whose truck is being rejected",
-    "truck_number": "Truck/vehicle registration number (e.g., RJ14GB1234) - DO NOT include extra words, max 20 chars",
-    "material_type": "Material in the truck (Maize/Dorb/Domc/Rice DDGS) or null",
-    "rejection_date": "Date of rejection or notice date in YYYY-MM-DD or null",
-    "plant_name": "Plant/location issuing the rejection (e.g. Kaladera, Bikaner, Jodhpur) or null",
-    "rejection_type": "'partial' if accepting with deduction/shortage, 'complete' if fully returning truck, or null",
-    "rejected_qty_qtl": 0.0,
-    "reason": "Text describing rejection reason (e.g., 'wet material', 'moisture high', 'fungus') or null",
+    "plant_name": "plant issuing the letter, from the letterhead (e.g. Jodhpur, Pali, Bikaner, Nadbai, Ajmer, Kaladera)",
+    "letter_ref": "letter reference number e.g. RCDF/CFP/BKN/2025-26/912-25",
+    "notice_date": "date of the letter, YYYY-MM-DD",
+    "recipient_name": "the supplier the letter is addressed to (M/s ...)",
+    "tender_rm_number": "RM / tender number if one applies to all rows, else null",
+    "trucks": [
+        {
+            "truck_number": "exact registration e.g. RJ52GA7138",
+            "rm_number": "RM / tender number on this row, e.g. 805 or RM-769",
+            "material_type": "Maize / Domc / Dorb / Rice Bran / Rice DDGS / Gawar Korma",
+            "reporting_date": "date the truck reported / was received, YYYY-MM-DD",
+            "rejection_date": "date of rejection or sampling, YYYY-MM-DD",
+            "qty_as_per_bilty_qtl": <quantity printed for this truck in quintals, else null>,
+            "rejected_qty_qtl": <rejected quantity ONLY if a rejected weight is printed, else null>,
+            "rejection_type": "'partial' if the letter says partly/partially rejected, else 'complete'",
+            "reason": "grounds of rejection exactly as written (e.g. High moisture 11.69%)"
+        }
+    ],
     "confidence": 0.0,
     "unclear_fields": ["field names"]
 }
 
 Rules:
-- If quantity unit is MT convert to Qtl (x10). If KG convert to Qtl (/100).
-- If rejected quantity is not clearly readable or it's a complete rejection without a specific weight, set it to null.
-- reason should capture specifically why it was rejected.
-- truck_number is extremely critical, extract exact alphanumeric (e.g., RJ20GB6238).
+- Include every truck row in the table. Never invent a truck or a quantity: use null.
+- Copy truck numbers character by character; drop spaces and dashes.
+- "Truck returned / redirected without unloading" with no "partly" means complete rejection.
+- Convert MT to quintal (x10) and KG to quintal (/100) only when the unit is printed.
 """
 
 SUPPORTED_DOCUMENT_TYPES = {
@@ -4822,10 +4833,71 @@ def _normalize_rejection_notice_result(result: dict) -> dict:
     out["rejection_type"] = _pick_first(out, ["rejection_type", "rejection_status", "status"])
     out["tender_rm_number"] = _pick_first(out, ["tender_rm_number", "rm_number", "tender_number", "rm_ref"])
 
-    qty_raw = _pick_first(out, ["rejected_qty_qtl", "quantity_qtl", "weight_qtl", "weight"])
+    qty_raw = _pick_first(out, ["rejected_qty_qtl", "weight_qtl"])
     unit_hint = _pick_first(out, ["quantity_unit", "weight_unit", "unit"]) or ""
-    out["rejected_qty_qtl"] = _to_qtl(qty_raw, str(unit_hint))
+    out["rejected_qty_qtl"] = _to_qtl(qty_raw, str(unit_hint)) if qty_raw is not None else None
+
+    trucks = []
+    raw_rows = out.get("trucks") if isinstance(out.get("trucks"), list) else []
+    if not raw_rows and out.get("truck_number"):
+        raw_rows = [dict(out)]
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        t = _pick_first(row, ["truck_number", "vehicle_number", "truck_no", "vehicle_no"])
+        t = re.sub(r"[^A-Z0-9]", "", str(t or "").upper()) or None
+        if not t:
+            continue
+        rtype = str(row.get("rejection_type") or out.get("rejection_type") or "").strip().lower()
+        trucks.append({
+            "truck_number": t,
+            "rm_number": row.get("rm_number") or out.get("tender_rm_number"),
+            "material_type": row.get("material_type") or out.get("material_type"),
+            "reporting_date": _normalize_date_text(row.get("reporting_date")),
+            "rejection_date": _normalize_date_text(row.get("rejection_date") or out.get("rejection_date")),
+            "qty_as_per_bilty_qtl": _to_float(row.get("qty_as_per_bilty_qtl")),
+            "rejected_qty_qtl": _to_float(row.get("rejected_qty_qtl")),
+            "rejection_type": "partial" if rtype.startswith("part") else "complete",
+            "reason": row.get("reason") or out.get("reason"),
+        })
+    out["trucks"] = trucks
+    if trucks:
+        out["truck_number"] = out["vehicle_number"] = trucks[0]["truck_number"]
+        out["rejection_date"] = out.get("rejection_date") or trucks[0]["rejection_date"]
     return out
+
+
+async def _extract_rejection_notice_verified(file_path: str, preferred_provider: Optional[str] = None) -> dict:
+    """Two independent readers must agree on the truck list; otherwise flag for review.
+
+    The truck number is what links a rejection to a bill and a payment, so a
+    single misread digit is never accepted silently.
+    """
+    first = await _extract_with_prompt_chain(file_path, REJECTION_NOTICE_PROMPT, "rejection_notice",
+                                             preferred_provider=preferred_provider or "gemini")
+    first = _normalize_rejection_notice_result(first if isinstance(first, dict) else {})
+    second_name = "mistral" if (preferred_provider or "gemini") != "mistral" else "gemini"
+    second = await _extract_with_prompt_chain(file_path, REJECTION_NOTICE_PROMPT, "rejection_notice",
+                                              preferred_provider=second_name)
+    second = _normalize_rejection_notice_result(second if isinstance(second, dict) else {})
+    if not first.get("trucks") and second.get("trucks"):
+        first, second = second, first
+    a = {t["truck_number"] for t in first.get("trucks") or []}
+    b = {t["truck_number"] for t in second.get("trucks") or []}
+    reasons = []
+    if not a:
+        reasons.append("No truck number could be read")
+    elif not b:
+        reasons.append("Only one reader could read this letter; truck numbers not confirmed")
+    elif a != b:
+        reasons.append(f"Readers disagree on truck numbers: {sorted(a)} vs {sorted(b)}")
+    first["verification"] = {"readers": [first.get("source"), second.get("source")],
+                             "trucks_agree": bool(a) and a == b}
+    first["review_reasons"] = reasons
+    first["needs_review"] = bool(reasons)
+    first["high_confidence"] = not reasons
+    first["confidence"] = 1.0 if not reasons else 0.4
+    return first
 
 
 async def _extract_with_azure_prompt(file_path: str, doc_type: str, source_tag: str) -> dict:
@@ -5017,8 +5089,7 @@ async def extract_purchase_order_doc(file_path: str, preferred_provider: Optiona
 
 
 async def extract_rejection_notice(file_path: str, preferred_provider: Optional[str] = None) -> dict:
-    result = await _extract_with_prompt_chain(file_path, REJECTION_NOTICE_PROMPT, "rejection_notice", preferred_provider=preferred_provider)
-    result = _normalize_rejection_notice_result(result)
+    result = await _extract_rejection_notice_verified(file_path, preferred_provider=preferred_provider)
     result["document_type"] = "rejection_notice"
     return result
 

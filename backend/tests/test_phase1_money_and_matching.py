@@ -195,7 +195,7 @@ class RejectionNoticeTests(DbCase):
             "rejection_type": "partial", "rejected_qty_qtl": 20, "reason": "Fungus",
             "rejection_date": "2026-11-13",
         }))
-        self.assertIn("updated_receipt_id", out)
+        self.assertIn("updated_receipt_id", out["trucks"][0])
         receipts = self.db.execute(sa.select(m.PlantReceipt)).scalars().all()
         self.assertEqual(len(receipts), 1)
         self.assertEqual(float(receipts[0].accepted_mt), 280)
@@ -210,12 +210,65 @@ class RejectionNoticeTests(DbCase):
             "rejection_type": "complete", "quantity_qtl": 300, "reason": "Quality",
             "rejection_date": "2026-11-12",
         }))
-        self.assertIn("created_receipt_id", out)
-        r = self.db.get(m.PlantReceipt, out["created_receipt_id"])
+        self.assertIn("created_receipt_id", out["trucks"][0])
+        r = self.db.get(m.PlantReceipt, out["trucks"][0]["created_receipt_id"])
         self.assertEqual(float(r.rejected_mt), 300)
         self.assertEqual(float(r.accepted_mt), 0)
         self.assertIsNotNone(r.dispatch_id)
         self.assertEqual(main._purchase_bill_payment_state(self.pb_for(b))["payment_state"], "nothing_due")
+
+
+class RealLetterTests(RejectionNoticeTests):
+    """Shapes taken from real plant letters: no weight printed, several trucks, Hindi."""
+
+    def test_partly_rejected_without_qty_uses_bill_minus_unloaded(self):
+        # "Partly rejected material redirected to party without unloading."
+        b = self.make_bill(qty=300)
+        self.approve(b)
+        self.add_receipt(b.vehicle_number, accepted=262.5, rejected=0)
+        out = main._apply_pending_action(self.db, self.pending({
+            "plant_name": "Ajmer",
+            "trucks": [{"truck_number": "RJ01AB1234", "material_type": "Maize", "rejection_type": "partial",
+                        "reason": "S.F discolouration 4.76% & live insects", "rejection_date": "2026-11-12"}],
+        }))
+        row = out["trucks"][0]
+        self.assertFalse(out["manual_required"], out)
+        self.assertAlmostEqual(row["rejected_qtl"], 37.5)
+        pb = self.pb_for(b)
+        self.assertAlmostEqual(float(pb.qty_mt), 262.5)   # pay only what was unloaded
+
+    def test_complete_rejection_without_qty_uses_dispatch(self):
+        b = self.make_bill(qty=300)
+        self.approve(b)
+        out = main._apply_pending_action(self.db, self.pending({
+            "plant_name": "Ajmer", "rejection_date": "2026-11-11",
+            "trucks": [{"truck_number": "RJ01AB1234", "material_type": "Maize", "reason": "High moisture 11.69%"}],
+        }))
+        row = out["trucks"][0]
+        self.assertEqual(row["rejection_type"], "complete")
+        self.assertEqual(row["rejected_qtl"], 300)
+        self.assertEqual(main._purchase_bill_payment_state(self.pb_for(b))["payment_state"], "nothing_due")
+
+    def test_letter_with_two_trucks(self):
+        b1 = self.make_bill(qty=266.1, truck="RJ07GD4626")
+        b2 = self.make_bill(qty=243.2, truck="RJ07GE0056")
+        self.approve(b1); self.approve(b2)
+        out = main._apply_pending_action(self.db, self.pending({
+            "plant_name": "Ajmer", "rejection_date": "2026-11-12",
+            "trucks": [
+                {"truck_number": "RJ07 GD 4626", "material_type": "Maize", "qty_as_per_bilty_qtl": 266.10, "reason": "High silica"},
+                {"truck_number": "RJ07 GE 0056", "material_type": "Maize", "qty_as_per_bilty_qtl": 243.20, "reason": "High fibre"},
+            ],
+        }))
+        self.assertFalse(out["manual_required"], out)
+        self.assertEqual([t["rejected_qtl"] for t in out["trucks"]], [266.1, 243.2])
+
+    def test_unknown_truck_partial_goes_to_review(self):
+        out = main._apply_pending_action(self.db, self.pending({
+            "plant_name": "Ajmer",
+            "trucks": [{"truck_number": "RJ99ZZ9999", "rejection_type": "partial", "reason": "x"}],
+        }))
+        self.assertTrue(out["manual_required"])
 
 
 class EmailCheckpointTests(unittest.TestCase):

@@ -4223,6 +4223,34 @@ OWN_COMPANY_IDENTIFIERS = [
     {"name": "shree ganpati enterprises", "email": "vinayakkhandelwal88@gmail.com"},
 ]
 
+def _match_own_firm(name: Optional[str], min_score: float = 0.85) -> Optional[str]:
+    """Strictly match a printed party name to one of our three firms.
+
+    Stricter than _detect_own_company: "Shree Shyam Trading Company" or
+    "Shree Nath Traders" must NOT count as ours.
+    """
+    src_n = _norm_text(re.sub(r"(?i)^\s*m\s*/?\s*s\.?\s*", "", str(name or "")))
+    if len(src_n) < 6:
+        return None
+    aliased = _OWN_COMPANY_ALIAS_MAP.get(src_n)
+    if aliased:
+        return aliased
+    for nm in _OWN_COMPANY_CANONICAL_NAMES:
+        if _norm_text(nm) in src_n:
+            return nm
+    # Abbreviations like "SHREE NATH IND." / "Shree Vinayak Trd Co": same first two
+    # words, and the third word is a prefix of ours.
+    src_tokens = re.findall(r"[a-z0-9]+", src_n)
+    for nm in _OWN_COMPANY_CANONICAL_NAMES:
+        own_tokens = re.findall(r"[a-z0-9]+", _norm_text(nm))
+        if (len(src_tokens) >= 3 and src_tokens[:2] == own_tokens[:2]
+                and len(src_tokens[2]) >= 3 and own_tokens[2].startswith(src_tokens[2][:3])
+                and src_tokens[2][0] == own_tokens[2][0]):
+            return nm
+    best = max(_OWN_COMPANY_CANONICAL_NAMES, key=lambda nm: _name_similarity(src_n, nm))
+    return best if _name_similarity(src_n, best) >= min_score else None
+
+
 def _annotate_purchase_bill_firm(db: Session, extracted: dict) -> Optional[int]:
     """Work out which of our firms a purchase bill belongs to, from the bill itself.
 
@@ -4234,18 +4262,8 @@ def _annotate_purchase_bill_firm(db: Session, extracted: dict) -> Optional[int]:
         return None
     reasons = extracted.get("review_reasons") if isinstance(extracted.get("review_reasons"), list) else []
 
-    def _own_firm(name: Optional[str], min_score: float) -> Optional[str]:
-        src_n = _norm_text(re.sub(r"(?i)^\s*m\s*/?\s*s\.?\s*", "", str(name or "")))
-        if len(src_n) < 6:
-            return None
-        for nm in _OWN_COMPANY_CANONICAL_NAMES:
-            if _norm_text(nm) in src_n:
-                return nm
-        best = max(_OWN_COMPANY_CANONICAL_NAMES, key=lambda nm: _name_similarity(src_n, nm))
-        return best if _name_similarity(src_n, best) >= min_score else None
-
-    seller_firm = _own_firm(extracted.get("vendor_name"), 0.85)
-    buyer_firm = _own_firm(extracted.get("buyer_name"), 0.75)
+    seller_firm = _match_own_firm(extracted.get("vendor_name"), 0.85)
+    buyer_firm = _match_own_firm(extracted.get("buyer_name"), 0.75)
 
     company_id = None
     if seller_firm:
@@ -5092,6 +5110,160 @@ def _ensure_cycle_for_po_action(db: Session, company_id: Optional[int], start_da
     return cycle
 
 
+REJECTION_DISPATCH_LOOKBACK_DAYS = 20
+
+
+def _find_dispatch_for_rejection(db: Session, truck_key: str, plant_id: int, company_id: Optional[int],
+                                 material_id: Optional[int], ref_date: date) -> Optional[Dispatch]:
+    """The dispatch (truck trip) a rejection refers to: same truck/plant/firm, loaded shortly before."""
+    q = select(Dispatch).where(Dispatch.is_deleted == False, Dispatch.plant_id == plant_id)
+    found = []
+    for d in db.execute(q).scalars().all():
+        if _norm_vehicle(d.vehicle_number) != truck_key:
+            continue
+        if company_id is not None and d.company_id is not None and d.company_id != company_id:
+            continue
+        if material_id and d.material_id and d.material_id != material_id:
+            continue
+        if d.dispatch_date:
+            gap = (ref_date - d.dispatch_date).days
+            if gap < -2 or gap > REJECTION_DISPATCH_LOOKBACK_DAYS:
+                continue
+        found.append(d)
+    found = _closest_trip(found, ref_date, lambda d: d.dispatch_date)
+    return found[0] if len(found) == 1 else None
+
+
+def _apply_rejection_truck(db: Session, company_id: Optional[int], main_tender_id: Optional[int],
+                           tender_id: Optional[int], plant_id: int, row: dict, notice: dict) -> dict:
+    """Record one truck from a plant rejection letter.
+
+    Plant letters usually do NOT print the rejected weight:
+      * complete rejection ("returned without unloading"): the whole truck, i.e.
+        the qty as per bilty, else the matching dispatch quantity;
+      * partial rejection: the plant unloads only the accepted part (in the
+        unloading register), so rejected = truck qty - accepted.
+    A quantity that cannot be derived is never guessed: the row goes to review.
+    """
+    vehicle = row.get("truck_number") or row.get("vehicle_number")
+    if not vehicle:
+        return {"truck": None, "manual_required": True, "reason": "truck number missing"}
+    truck_key = _norm_vehicle(vehicle)
+    mat_id, mat_name = _resolve_material(db, material_name=row.get("material_type") or notice.get("material_type"))
+    ref_date = (
+        _parse_optional_date(row.get("rejection_date") or row.get("reporting_date"))
+        or _parse_optional_date(notice.get("rejection_date") or notice.get("notice_date"))
+        or date.today()
+    )
+    rejection_type = str(row.get("rejection_type") or notice.get("rejection_type") or "").strip().lower()
+    if rejection_type not in {"partial", "complete"}:
+        rejection_type = "complete"  # letters that do not say "partly" return the whole truck
+    reason = str(row.get("reason") or notice.get("reason") or "").strip() or "Rejected by plant"
+    reason_full = f"{reason} ({rejection_type})"
+
+    explicit_rejected = _to_float(row.get("rejected_qty_qtl"))
+    truck_qty = _to_float(row.get("qty_as_per_bilty_qtl") or row.get("quantity_qtl"))
+
+    # Existing plant receipt for this trip (usually from the unloading register).
+    rq = select(PlantReceipt).where(PlantReceipt.is_deleted == False, PlantReceipt.plant_id == plant_id)
+    near = []
+    for r0 in db.execute(rq).scalars().all():
+        if _norm_vehicle(r0.vehicle_number) != truck_key:
+            continue
+        if company_id is not None and r0.company_id is not None and r0.company_id != company_id:
+            continue
+        if mat_id and r0.material_id and r0.material_id != mat_id:
+            continue
+        if r0.receipt_date and abs((r0.receipt_date - ref_date).days) > 10:
+            continue
+        near.append(r0)
+    near = _closest_trip(near, ref_date, lambda r: r.receipt_date)
+    if len(near) > 1:
+        return {"truck": vehicle, "manual_required": True,
+                "reason": f"{len(near)} plant receipts for this truck within 10 days; choose the right one"}
+    existing = near[0] if near else None
+    dispatch = None
+    if existing is not None and existing.dispatch_id:
+        dispatch = db.get(Dispatch, existing.dispatch_id)
+    if dispatch is None:
+        dispatch = _find_dispatch_for_rejection(db, truck_key, plant_id, company_id, mat_id, ref_date)
+    dispatch_qty = float(dispatch.qty_mt) if dispatch is not None and dispatch.qty_mt is not None else None
+
+    if rejection_type == "complete":
+        accepted = 0.0
+        rejected = explicit_rejected or truck_qty or dispatch_qty
+        if rejected is None and existing is not None:
+            rejected = float(existing.accepted_mt or 0) + float(existing.rejected_mt or 0)
+    else:
+        rejected = explicit_rejected
+        base_qty = truck_qty or dispatch_qty
+        if existing is not None:
+            accepted = float(existing.accepted_mt or 0)
+            if rejected is None and base_qty is not None and base_qty > accepted:
+                rejected = round(base_qty - accepted, 3)
+        else:
+            if rejected is not None and base_qty is not None and base_qty >= rejected:
+                accepted = round(base_qty - rejected, 3)
+            else:
+                return {"truck": vehicle, "manual_required": True,
+                        "reason": "partial rejection: waiting for the plant unloading register to know the accepted qty"}
+
+    if rejected is None or rejected <= 0:
+        return {"truck": vehicle, "manual_required": True,
+                "reason": "rejected quantity not printed and no matching bill/dispatch to derive it from"}
+
+    if existing is not None:
+        r = existing
+        old_acc, old_rej = float(r.accepted_mt or 0), float(r.rejected_mt or 0)
+        new_acc = 0.0 if rejection_type == "complete" else old_acc
+        new_rej = float(rejected)
+        if r.dispatch_id:
+            _apply_receipt_delta(db, r.dispatch_id, new_acc - old_acc, new_rej - old_rej)
+            r.matched_qty_qtl = new_acc + new_rej
+        r.accepted_mt, r.rejected_mt = new_acc, new_rej
+        r.received_qty_qtl = new_acc + new_rej
+        r.rejection_reason = reason_full
+        db.flush()
+        _refresh_dispatch_status(db, r.dispatch_id)
+        return {"truck": vehicle, "updated_receipt_id": r.id, "accepted_qtl": new_acc, "rejected_qtl": new_rej,
+                "rejection_type": rejection_type}
+
+    receipt = PlantReceipt(
+        company_id=company_id, main_tender_id=main_tender_id, tender_id=tender_id,
+        dispatch_id=None, vehicle_number=str(vehicle).strip()[:20], plant_id=plant_id,
+        receipt_date=ref_date, accepted_mt=accepted, rejected_mt=rejected,
+        received_qty_qtl=accepted + rejected, matched_qty_qtl=0, match_status="unmatched",
+        material_id=mat_id, material_name=mat_name,
+        rm_number=row.get("rm_number") or notice.get("tender_rm_number"),
+        po_number=notice.get("po_number"), party_name=notice.get("recipient_name") or notice.get("vendor_name"),
+        rejection_reason=reason_full, source="ingest",
+        email_raw=json.dumps(row, ensure_ascii=False, default=str),
+    )
+    db.add(receipt)
+    db.flush()
+    if dispatch is not None and not _active_receipt_for_dispatch(db, dispatch.id, exclude_receipt_id=receipt.id):
+        receipt.dispatch_id = dispatch.id
+        receipt.match_status = "auto"
+        receipt.match_reason = "Matched rejection to truck trip (truck + plant + firm + date)"
+    else:
+        _match_receipt_to_dispatch(db, receipt, manual=False)
+    if receipt.dispatch_id:
+        try:
+            _apply_receipt_delta(db, receipt.dispatch_id, accepted, rejected)
+            receipt.matched_dispatch_id = receipt.dispatch_id
+            receipt.matched_qty_qtl = accepted + rejected
+            receipt.match_applied_at = datetime.now()
+        except HTTPException as exc:
+            receipt.dispatch_id = None
+            receipt.matched_dispatch_id = None
+            receipt.match_status = "unmatched"
+            receipt.match_reason = f"Auto-match not applied: {exc.detail}"
+    db.flush()
+    _refresh_dispatch_status(db, receipt.dispatch_id)
+    return {"truck": vehicle, "created_receipt_id": receipt.id, "accepted_qtl": accepted, "rejected_qtl": rejected,
+            "rejection_type": rejection_type, "match_status": receipt.match_status}
+
+
 def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
     payload = p.extracted_payload or {}
     if not isinstance(payload, dict):
@@ -5196,14 +5368,6 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
         }
 
     if doc_type == "rejection_notice":
-        vehicle = payload.get("vehicle_number") or payload.get("truck_number")
-        if not vehicle:
-            return {
-                "document_type": doc_type,
-                "manual_required": True,
-                "reason": "rejection_notice action requires truck number",
-            }
-
         plant_name = payload.get("plant_name") or payload.get("destination_plant")
         plant_id, _ = _resolve_plant(db, plant_name)
         if not plant_id:
@@ -5212,142 +5376,29 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
                 "manual_required": True,
                 "reason": "rejection_notice action requires a resolvable plant",
             }
+        if company_id is None:
+            firm = _match_own_firm(payload.get("recipient_name") or payload.get("vendor_name"), 0.75)
+            if firm:
+                company_id = _find_company_exact(db, firm)
 
-        mat_id, mat_name = _resolve_material(db, material_name=payload.get("material_type") or payload.get("item_name"))
-
-        rejection_date = _parse_optional_date(payload.get("rejection_date") or payload.get("notice_date") or payload.get("bill_date"))
-        rejection_type = str(payload.get("rejection_type") or "").strip().lower()
-        reason = str(payload.get("reason") or "").strip() or "Auto-created from rejection notice"
-        if rejection_type in {"partial", "complete"}:
-            reason = f"{reason} ({rejection_type})"
-
-        # Quantities are quintals. Never invent a rejected quantity: a wrong number
-        # here directly changes what gets paid, so unclear notices go to review.
-        explicit_rejected = _to_float(payload.get("rejected_qty_qtl"))
-        truck_qty = _to_float(payload.get("quantity_qtl"))
-        if truck_qty is None:
-            truck_qty = _to_float(payload.get("weight"))
-
-        truck_key = _norm_vehicle(vehicle)
-        ref_date = rejection_date or date.today()
-
-        # Partial rejection usually follows an unloading register row for the same
-        # truck: update that receipt instead of creating a second one.
-        existing_receipt = None
-        rq = select(PlantReceipt).where(
-            PlantReceipt.is_deleted == False,
-            PlantReceipt.plant_id == plant_id,
-        )
-        if company_id is not None:
-            rq = rq.where(or_(PlantReceipt.company_id == company_id, PlantReceipt.company_id == None))
-        near = []
-        for r0 in db.execute(rq).scalars().all():
-            if _norm_vehicle(r0.vehicle_number) != truck_key:
+        rows = payload.get("trucks") if isinstance(payload.get("trucks"), list) and payload.get("trucks") else [payload]
+        results = []
+        for row in rows:
+            if not isinstance(row, dict):
                 continue
-            if mat_id and r0.material_id and r0.material_id != mat_id:
-                continue
-            if r0.receipt_date and abs((r0.receipt_date - ref_date).days) > 10:
-                continue
-            near.append(r0)
-        if len(near) > 1:
-            return {
-                "document_type": doc_type,
-                "manual_required": True,
-                "reason": f"Truck {vehicle} has {len(near)} plant receipts within 10 days; choose the right one manually.",
-            }
-        if near:
-            existing_receipt = near[0]
-
-        if rejection_type == "complete":
-            rejected = explicit_rejected
-            if rejected is None:
-                rejected = truck_qty
-            if rejected is None and existing_receipt is not None:
-                rejected = float(existing_receipt.accepted_mt or 0) + float(existing_receipt.rejected_mt or 0)
-            accepted = 0.0
-        else:
-            rejected = explicit_rejected
-            accepted = None
-            if rejected is not None and truck_qty is not None and truck_qty >= rejected:
-                accepted = round(truck_qty - rejected, 3)
-
-        if rejected is None or rejected <= 0:
-            return {
-                "document_type": doc_type,
-                "manual_required": True,
-                "reason": "Rejected quantity not found in the notice. Enter it manually.",
-            }
-
-        if existing_receipt is not None:
-            r = existing_receipt
-            old_acc = float(r.accepted_mt or 0)
-            old_rej = float(r.rejected_mt or 0)
-            if rejection_type == "complete":
-                new_acc, new_rej = 0.0, float(rejected)
-            else:
-                new_rej = float(rejected)
-                # The plant unloading register is the authority for accepted qty.
-                new_acc = old_acc
-            if r.dispatch_id:
-                try:
-                    _apply_receipt_delta(db, r.dispatch_id, new_acc - old_acc, new_rej - old_rej)
-                except HTTPException as exc:
-                    return {
-                        "document_type": doc_type,
-                        "manual_required": True,
-                        "reason": f"Rejection does not fit receipt #{r.id}: {exc.detail}",
-                    }
-                r.matched_qty_qtl = new_acc + new_rej
-            r.accepted_mt = new_acc
-            r.rejected_mt = new_rej
-            r.received_qty_qtl = new_acc + new_rej
-            r.rejection_reason = reason
-            db.flush()
-            _refresh_dispatch_status(db, r.dispatch_id)
-            return {"updated_receipt_id": r.id, "document_type": doc_type}
-
-        if accepted is None:
-            accepted = 0.0
-
-        receipt = PlantReceipt(
-            company_id=company_id,
-            main_tender_id=main_tender_id,
-            tender_id=tender_id,
-            dispatch_id=None,
-            vehicle_number=str(vehicle).strip()[:20],
-            plant_id=plant_id,
-            receipt_date=ref_date,
-            accepted_mt=accepted,
-            rejected_mt=rejected,
-            received_qty_qtl=accepted + rejected,
-            matched_qty_qtl=0,
-            match_status="unmatched",
-            material_id=mat_id,
-            material_name=mat_name,
-            rm_number=payload.get("tender_rm_number") or payload.get("rm_number") or payload.get("tender_number"),
-            po_number=payload.get("po_number"),
-            party_name=payload.get("vendor_name"),
-            rejection_reason=reason,
-            source="ingest",
-            email_raw=json.dumps(payload, ensure_ascii=False),
-        )
-        db.add(receipt)
-        db.flush()
-        _match_receipt_to_dispatch(db, receipt, manual=False)
-        if receipt.dispatch_id:
             try:
-                _apply_receipt_delta(db, receipt.dispatch_id, accepted, rejected)
-                receipt.matched_dispatch_id = receipt.dispatch_id
-                receipt.matched_qty_qtl = accepted + rejected
-                receipt.match_applied_at = datetime.now()
+                with db.begin_nested():
+                    results.append(_apply_rejection_truck(db, company_id, main_tender_id, tender_id, plant_id, row, payload))
             except HTTPException as exc:
-                receipt.dispatch_id = None
-                receipt.matched_dispatch_id = None
-                receipt.match_status = "unmatched"
-                receipt.match_reason = f"Auto-match not applied: {exc.detail}"
-        db.flush()
-        _refresh_dispatch_status(db, receipt.dispatch_id)
-        return {"created_receipt_id": receipt.id, "document_type": doc_type, "match_status": receipt.match_status}
+                results.append({"truck": row.get("truck_number") or row.get("vehicle_number"), "manual_required": True,
+                                "reason": str(exc.detail)})
+        manual = [r for r in results if r.get("manual_required")]
+        return {
+            "document_type": doc_type,
+            "trucks": results,
+            "manual_required": bool(manual) or not results,
+            "reason": "; ".join(f"{r.get('truck')}: {r.get('reason')}" for r in manual) if manual else None,
+        }
 
     if doc_type == "tender_notice":
         tender_ref = payload.get("tender_rm_number") or payload.get("tender_number") or payload.get("rm_number")
@@ -5452,16 +5503,12 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
             qty = _to_float(item.get("approved_quantity_qtl") or item.get("quantity_qtl"))
             rate = _to_float(item.get("approved_rate_per_qtl") or item.get("rate_per_qtl"))
             amt = _to_float(item.get("line_amount") or item.get("amount"))
-            approved_party = item.get("approved_party_name") or payload.get("winner_party_name") or own_company
-
-            line_payload = {
-                "approved_party_name": approved_party,
-                "winner_party_name": payload.get("winner_party_name"),
-                "buyer_name": payload.get("buyer_name"),
-                "winner_party_email": payload.get("winner_party_email"),
-                "buyer_email": payload.get("buyer_email"),
-            }
-            if not _detect_own_company(line_payload):
+            approved_party = item.get("approved_party_name")
+            # A PO lists every item of the plant with the party approved for it.
+            # Only lines approved to one of OUR firms are ours; a blank party or a
+            # similar-sounding name (e.g. Shree Shyam Trading) is not.
+            line_firm = _match_own_firm(approved_party, 0.85) if approved_party else None
+            if not line_firm:
                 skipped_lines.append(idx)
                 continue
 
