@@ -1221,7 +1221,15 @@ async def _extract_bill_legacy(image_path: str) -> dict:
     return _merge_and_validate(cloud_best if isinstance(cloud_best, dict) else {}, paddle_res)
 
 
+GITHUB_MODELS_RETIRED = "GitHub Models was retired by GitHub on 2026-07-30; provider disabled"
+
+
 async def extract_with_github_models(image_path: str) -> dict:
+    # Retired service: fail instantly instead of spending ~20s on dead endpoints.
+    return {"source": "github", "error": GITHUB_MODELS_RETIRED, "high_confidence": False}
+
+
+async def _extract_with_github_models_retired(image_path: str) -> dict:
     try:
         from openai import OpenAI
     except Exception as e:
@@ -3669,6 +3677,7 @@ Return only strict JSON:
             return None
 
     def _github_vision_classify(prompt: str, image_path: str, mime: str) -> Optional[dict]:
+        return None  # GitHub Models retired 2026-07-30
         load_dotenv()
         api_key = (os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_MODELS_API_KEY") or "").strip()
         if not api_key:
@@ -4325,6 +4334,10 @@ async def _extract_with_gemini_prompt_one(file_path: str, prompt_text: str, sour
 
 
 async def _extract_with_github_prompt(file_path: str, prompt_text: str, source_tag: str) -> dict:
+    return {"source": source_tag, "error": GITHUB_MODELS_RETIRED, "high_confidence": False}
+
+
+async def _extract_with_github_prompt_retired(file_path: str, prompt_text: str, source_tag: str) -> dict:
     try:
         from openai import OpenAI
     except Exception as e:
