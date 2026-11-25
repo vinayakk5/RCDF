@@ -752,7 +752,8 @@ class AutoApprovalDecision(Base):
     """
     __tablename__ = "auto_approval_decisions"
     id                = Column(Integer, primary_key=True, index=True)
-    pending_ingest_id = Column(Integer, ForeignKey("pending_ingests.id"), nullable=False, unique=True)
+    # No FK: the person may delete the pending ingest; the decision stays for the report.
+    pending_ingest_id = Column(Integer, nullable=False, unique=True)
     company_id        = Column(Integer, nullable=True)
     document_type     = Column(String(40))
     mode              = Column(String(10), default="shadow")     # shadow | live

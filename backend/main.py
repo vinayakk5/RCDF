@@ -712,6 +712,15 @@ async def _email_sync_scheduler_loop(stop_event: asyncio.Event) -> None:
                 log.warning("Email auto-sync failed: %s", e)
 
         try:
+            with SessionLocal() as db:
+                res = run_auto_approval_pass(db)
+                if res.get("evaluated"):
+                    log.info("Auto-approval (%s): evaluated=%s would_approve=%s acted=%s",
+                             res.get("mode"), res.get("evaluated"), res.get("would_approve"), res.get("acted"))
+        except Exception as e:
+            log.warning("Auto-approval pass failed: %s", e)
+
+        try:
             await asyncio.wait_for(stop_event.wait(), timeout=_email_sync_interval_seconds())
         except asyncio.TimeoutError:
             continue
@@ -8361,6 +8370,305 @@ def bulk_delete_pending_ingests(
         "files_deleted": files_deleted,
         "file_delete_errors": file_delete_errors,
         "missing_ids": missing_ids,
+    }
+
+
+# ── AUTO-APPROVAL (shadow mode first) ─────────────────────────────────────
+#
+# A purchase bill is auto-approved only when it passes every check below. Mode
+# comes from AUTO_APPROVE_MODE: "shadow" (default) records the decision and does
+# nothing else, "live" approves and books it, "off" skips. Run shadow mode for a
+# few weeks and compare with /api/auto-approval/report before going live.
+
+AUTO_APPROVE_MAX_RATE_OVER_DEAL = float(os.getenv("AUTO_APPROVE_MAX_RATE_OVER_DEAL", "0.02"))
+AUTO_APPROVE_MAX_BILL_AGE_DAYS = int(os.getenv("AUTO_APPROVE_MAX_BILL_AGE_DAYS", "45"))
+
+
+def auto_approve_mode() -> str:
+    mode = str(os.getenv("AUTO_APPROVE_MODE", "shadow")).strip().lower()
+    return mode if mode in ("off", "shadow", "live") else "shadow"
+
+
+def _auto_approval_checks(db: Session, p: PendingIngest) -> tuple[list, Optional[dict]]:
+    """Every check for one pending purchase bill. Never writes to the database."""
+    payload = p.extracted_payload if isinstance(p.extracted_payload, dict) else {}
+    checks: List[dict] = []
+
+    def add(name: str, ok: bool, detail: str = "") -> bool:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+        return bool(ok)
+
+    verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else {}
+    add("readers_agree", verification.get("auto_approve_ok") is True,
+        "; ".join(payload.get("review_reasons") or []) or "two readers agree on every key field and the math")
+    probe = dict(payload)
+    company_id = p.assigned_company_id if p.assigned_company_id is not None else p.company_id
+    detected = _annotate_purchase_bill_firm(db, probe)
+    add("not_own_sales_bill", not probe.get("looks_like_own_sales_bill"), "seller is not one of our firms")
+    if company_id is None:
+        company_id = detected
+    add("firm_known", company_id is not None, probe.get("detected_company") or "buyer firm not found on bill")
+
+    plant_id, plant_name = _resolve_plant(db, payload.get("destination_plant") or payload.get("plant_name"))
+    add("plant_known", plant_id is not None, plant_name or "plant not resolved")
+    material_id, material_name = _resolve_material(db, material_name=payload.get("material_type"))
+    add("material_known", material_id is not None, material_name or "material not resolved")
+
+    vendor = payload.get("vendor_name") or payload.get("broker_name")
+    bill_no = payload.get("bill_number")
+    add("not_duplicate", not _is_duplicate_bill(db, vendor, payload.get("vehicle_number"), bill_no),
+        f"bill {bill_no} from {vendor}")
+    same_file = None
+    if p.file_hash:
+        same_file = db.execute(select(PendingIngest.id).where(
+            PendingIngest.file_hash == p.file_hash, PendingIngest.id != p.id,
+            PendingIngest.status.in_([IngestStatus.approved, IngestStatus.processed]),
+        )).first()
+    add("file_not_seen_before", same_file is None, "same file already processed" if same_file else "new file")
+
+    bill_date = _parse_optional_date(payload.get("bill_date"))
+    fresh = bill_date is not None and (date.today() - timedelta(days=AUTO_APPROVE_MAX_BILL_AGE_DAYS)) <= bill_date <= date.today() + timedelta(days=1)
+    add("bill_date_recent", fresh, str(bill_date) if bill_date else "no bill date")
+
+    truck = _norm_vehicle(payload.get("vehicle_number")) or None
+    repeat = None
+    if truck and bill_date:
+        for d_id, d_truck in db.execute(select(Dispatch.id, Dispatch.vehicle_number).where(
+            Dispatch.is_deleted == False, Dispatch.dispatch_date == bill_date,
+        )).all():
+            if _norm_vehicle(d_truck) == truck:
+                repeat = d_id
+                break
+    add("truck_trip_new", repeat is None, f"truck {truck} already has a trip on {bill_date}" if repeat else "no other trip that day")
+
+    # Dry-run the deal assignment on a transient bill (not added to the session).
+    probe_bill = Bill(
+        company_id=company_id, broker_name=vendor, vehicle_number=truck,
+        material_id=material_id, material_name=material_name or payload.get("material_type"),
+        qty_mt=_to_float(payload.get("quantity_qtl")), rate_per_mt=_to_float(payload.get("rate_per_qtl")),
+        bill_date=bill_date, plant_id=plant_id, plant_name=plant_name,
+    )
+    if vendor:
+        b_obj = db.execute(select(Broker).where(func.lower(Broker.name) == str(vendor).strip().lower())).scalar_one_or_none()
+        if b_obj:
+            probe_bill.broker_id = b_obj.id
+    ranked = _rank_deals_for_bill(db, probe_bill)
+    best = ranked[0] if ranked else None
+    runner = ranked[1] if len(ranked) > 1 else None
+    clear = bool(best) and best["score"] >= 2.0 and (not runner or best["score"] - runner["score"] >= ASSIGN_MIN_LEAD)
+    add("deal_clear", clear,
+        (f"{best['deal_number']} / {best['tender_number']} score {best['score']}" + (f", next {runner['score']}" if runner else ""))
+        if best else "no matching open deal")
+    deal = db.get(Deal, best["deal_id"]) if clear else None
+    if deal:
+        deal_rate = float(deal.rate_per_mt or 0)
+        rate = float(probe_bill.rate_per_mt or 0)
+        add("rate_within_deal", deal_rate > 0 and 0 < rate <= deal_rate * (1 + AUTO_APPROVE_MAX_RATE_OVER_DEAL),
+            f"bill rate {rate:g} vs deal rate {deal_rate:g}")
+        open_qty = float(deal.deal_mt or 0) - float(deal.dispatched_mt or 0)
+        qty = float(probe_bill.qty_mt or 0)
+        add("qty_within_deal", 0 < qty <= open_qty + 0.5, f"bill {qty:g} qtl, deal open {open_qty:g} qtl")
+    else:
+        add("rate_within_deal", False, "no clear deal")
+        add("qty_within_deal", False, "no clear deal")
+    return checks, best if clear else None
+
+
+def evaluate_auto_approval(db: Session, p: PendingIngest, mode: Optional[str] = None) -> Optional[AutoApprovalDecision]:
+    mode = mode or auto_approve_mode()
+    if mode == "off" or not p.document_type or p.document_type != DocumentType.purchase_bill:
+        return None
+    dec = db.execute(select(AutoApprovalDecision).where(AutoApprovalDecision.pending_ingest_id == p.id)).scalar_one_or_none()
+    if dec and dec.acted:
+        return dec
+    if not dec:
+        dec = AutoApprovalDecision(pending_ingest_id=p.id)
+        db.add(dec)
+    try:
+        checks, best = _auto_approval_checks(db, p)
+        dec.error = None
+    except Exception as e:
+        log.warning("auto-approval checks failed for ingest %s: %s", p.id, e)
+        checks, best = [{"name": "checks_ran", "ok": False, "detail": str(e)[:300]}], None
+        dec.error = str(e)[:500]
+    dec.company_id = p.assigned_company_id if p.assigned_company_id is not None else p.company_id
+    dec.document_type = p.document_type.value
+    dec.mode = mode
+    dec.checks = checks
+    dec.failed_checks = [c["name"] for c in checks if not c["ok"]]
+    dec.would_approve = not dec.failed_checks
+    dec.predicted_deal_id = best["deal_id"] if best else None
+    dec.predicted_tender_id = best["tender_id"] if best else None
+    dec.evaluated_at = datetime.now()
+    db.flush()
+
+    if mode == "live" and dec.would_approve and p.status == IngestStatus.pending:
+        try:
+            with db.begin_nested():
+                p.status = IngestStatus.approved
+                p.action_status = "approved"
+                p.reviewed_by = "auto-approval"
+                p.reviewed_at = datetime.now()
+                result = _apply_pending_action(db, p)
+                bill_id = result.get("created_bill_id") if isinstance(result, dict) else None
+                bill = db.get(Bill, bill_id) if bill_id else None
+                if not bill or bill.deal_id != dec.predicted_deal_id:
+                    raise RuntimeError("deal assignment differed from the checked one")
+                p.action_payload = result
+                p.action_status = "processed"
+                p.status = IngestStatus.processed
+            approve_bill(bill_id, db=db)        # commits; creates purchase bill + dispatch
+            dec.acted = True
+            dec.acted_bill_id = bill_id
+            bill = db.get(Bill, bill_id)
+            if bill:
+                bill.reviewed_by = "auto-approval"
+            db.flush()
+        except Exception as e:
+            log.warning("auto-approval live action failed for ingest %s: %s", p.id, e)
+            dec.error = f"live action not applied: {str(e)[:400]}"
+            p.status = IngestStatus.pending
+            p.action_status = "pending"
+    return dec
+
+
+def run_auto_approval_pass(db: Session, limit: int = 200, force: bool = False) -> dict:
+    mode = auto_approve_mode()
+    if mode == "off":
+        return {"mode": mode, "evaluated": 0}
+    rows = db.execute(
+        select(PendingIngest)
+        .where(PendingIngest.document_type == DocumentType.purchase_bill,
+               PendingIngest.status == IngestStatus.pending)
+        .order_by(PendingIngest.id).limit(limit)
+    ).scalars().all()
+    done = {d.pending_ingest_id: d for d in db.execute(
+        select(AutoApprovalDecision).where(AutoApprovalDecision.pending_ingest_id.in_([r.id for r in rows] or [0]))
+    ).scalars().all()}
+    evaluated = would = acted = 0
+    for p in rows:
+        d = done.get(p.id)
+        if d and not force and d.evaluated_at and p.updated_at and d.evaluated_at >= p.updated_at:
+            continue        # already judged and the document has not changed since
+        dec = evaluate_auto_approval(db, p, mode)
+        if dec:
+            evaluated += 1
+            would += int(bool(dec.would_approve))
+            acted += int(bool(dec.acted))
+    db.commit()
+    return {"mode": mode, "evaluated": evaluated, "would_approve": would, "acted": acted}
+
+
+def _auto_decision_outcome(db: Session, dec: AutoApprovalDecision) -> dict:
+    """What the person did with the document, and whether auto-approval would have been right."""
+    p = db.get(PendingIngest, dec.pending_ingest_id)
+    if p is None:
+        return {"human": "deleted", "agrees": not dec.would_approve, "why": "person deleted the document"}
+    if p.status == IngestStatus.pending:
+        return {"human": "waiting", "agrees": None, "why": "not reviewed yet"}
+    if p.status == IngestStatus.rejected:
+        return {"human": "rejected", "agrees": not dec.would_approve, "why": "person rejected it"}
+    payload = p.action_payload if isinstance(p.action_payload, dict) else {}
+    bill = db.get(Bill, payload.get("created_bill_id")) if payload.get("created_bill_id") else None
+    if bill is None:
+        return {"human": "approved", "agrees": None, "why": "approved, bill not created yet"}
+    ex = p.extracted_payload if isinstance(p.extracted_payload, dict) else {}
+    edits = []
+    for field, key in (("qty_mt", "quantity_qtl"), ("rate_per_mt", "rate_per_qtl"), ("total_amount", "total_amount")):
+        a, b = _to_float(getattr(bill, field)), _to_float(ex.get(key))
+        if a is not None and b is not None and abs(a - b) > 0.01:
+            edits.append(field)
+    if _norm_code(bill.bill_number) != _norm_code(ex.get("bill_number")):
+        edits.append("bill_number")
+    if _norm_code(bill.vehicle_number) != _norm_code(ex.get("vehicle_number")):
+        edits.append("vehicle_number")
+    if bill.deal_id is None:
+        return {"human": "approved", "agrees": None, "why": "approved, deal not chosen yet", "bill_id": bill.id}
+    same_deal = bill.deal_id == dec.predicted_deal_id
+    if dec.would_approve:
+        ok = same_deal and not edits
+        why = "same deal, no corrections" if ok else (
+            f"person corrected {', '.join(edits)}" if edits else "person chose a different deal")
+    else:
+        ok = bool(edits) or not same_deal
+        why = "person had to correct it" if ok else "person approved it unchanged (auto-approval was too strict)"
+    return {"human": "approved", "agrees": ok, "why": why, "bill_id": bill.id, "edits": edits,
+            "human_deal_id": bill.deal_id}
+
+
+@app.get("/api/auto-approval/status")
+def auto_approval_status():
+    return {"mode": auto_approve_mode(),
+            "max_rate_over_deal": AUTO_APPROVE_MAX_RATE_OVER_DEAL,
+            "max_bill_age_days": AUTO_APPROVE_MAX_BILL_AGE_DAYS}
+
+
+@app.post("/api/auto-approval/run")
+def auto_approval_run(force: bool = False, db: Session = Depends(get_db)):
+    return run_auto_approval_pass(db, force=force)
+
+
+@app.get("/api/auto-approval/decisions")
+def auto_approval_decisions(company_id: Optional[int] = None, limit: int = 200, db: Session = Depends(get_db)):
+    q = select(AutoApprovalDecision).order_by(desc(AutoApprovalDecision.evaluated_at)).limit(max(1, min(limit, 1000)))
+    if company_id is not None:
+        q = q.where(AutoApprovalDecision.company_id == company_id)
+    out = []
+    for d in db.execute(q).scalars().all():
+        p = db.get(PendingIngest, d.pending_ingest_id)
+        ex = (p.extracted_payload if p and isinstance(p.extracted_payload, dict) else {}) or {}
+        out.append({
+            "id": d.id, "pending_ingest_id": d.pending_ingest_id, "mode": d.mode,
+            "would_approve": d.would_approve, "acted": d.acted, "failed_checks": d.failed_checks or [],
+            "checks": d.checks or [], "predicted_deal_id": d.predicted_deal_id,
+            "evaluated_at": str(d.evaluated_at) if d.evaluated_at else None, "error": d.error,
+            "file_name": p.file_name if p else None,
+            "vendor": ex.get("vendor_name"), "bill_number": ex.get("bill_number"),
+            "vehicle_number": ex.get("vehicle_number"), "total_amount": ex.get("total_amount"),
+            "outcome": _auto_decision_outcome(db, d),
+        })
+    return out
+
+
+@app.get("/api/auto-approval/report")
+def auto_approval_report(company_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """Shadow-mode scorecard: how often auto-approval agreed with the person."""
+    q = select(AutoApprovalDecision)
+    if company_id is not None:
+        q = q.where(AutoApprovalDecision.company_id == company_id)
+    stats = {"decisions": 0, "would_approve": 0, "would_hold": 0, "reviewed": 0,
+             "approve_agreed": 0, "approve_wrong": 0, "hold_needed": 0, "hold_unneeded": 0}
+    wrong = []
+    failed_counts: dict = {}
+    for d in db.execute(q).scalars().all():
+        stats["decisions"] += 1
+        stats["would_approve" if d.would_approve else "would_hold"] += 1
+        for name in d.failed_checks or []:
+            failed_counts[name] = failed_counts.get(name, 0) + 1
+        o = _auto_decision_outcome(db, d)
+        if o.get("agrees") is None:
+            continue
+        stats["reviewed"] += 1
+        if d.would_approve:
+            if o["agrees"]:
+                stats["approve_agreed"] += 1
+            else:
+                stats["approve_wrong"] += 1
+                wrong.append({"pending_ingest_id": d.pending_ingest_id, "why": o.get("why")})
+        else:
+            stats["hold_needed" if o["agrees"] else "hold_unneeded"] += 1
+    judged = stats["approve_agreed"] + stats["approve_wrong"]
+    ready = judged >= 50 and stats["approve_wrong"] == 0
+    return {
+        "mode": auto_approve_mode(),
+        **stats,
+        "approve_accuracy": round(stats["approve_agreed"] / judged, 3) if judged else None,
+        "wrong_auto_approvals": wrong[:50],
+        "most_failed_checks": sorted(failed_counts.items(), key=lambda kv: -kv[1])[:10],
+        "ready_for_live": ready,
+        "advice": ("Auto-approval agreed with every reviewed bill (50+). It can be switched to live with AUTO_APPROVE_MODE=live."
+                   if ready else
+                   "Keep shadow mode until at least 50 would-approve bills are reviewed with zero wrong ones."),
     }
 
 
