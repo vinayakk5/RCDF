@@ -35,14 +35,15 @@ class Settings(BaseSettings):
     email_pass:  str = ""
     email_sync_auto_enabled: bool = True
     email_sync_runs_per_day: int = 4
+    email_sync_interval_seconds: int = 180
     email_sync_limit: int = 80
-    # Default to syncing both read and unread emails.
-    email_sync_unread_only: bool = False
+    # Default to syncing strictly UNSEEN (unread) emails.
+    email_sync_unread_only: bool = True
     email_sync_mark_seen: bool = False
     email_sync_mailbox: str = "INBOX"
     # Comma-separated sender email IDs allowed for ingest.
-    # Empty means allow all senders.
-    email_sync_allowed_senders: str = "cfpjdh-rcdf-rj@nic.in,cfppaliskrm@gmail.com,cattlefeedkaladera@gmail.com,md-rcdf@rajasthan.gov.in,cfpbkn@gmail.com,cfpbik-rcdf-rj@nic.in,rcdfcf_ajm1@rediffmail.com,cfpjdh@gmail.com,cfplambiya@gmail.com,cfp.kaladera@gmail.com,cfppali@gmail.com,pur-rcdf-rj@gov.in,pur-rcdf-rj@nic.in,fa-rcdf-rj@nic.in,pa-rcdf@rajasthan.gov.in,cfpnadbai786@gmail.com,cfpndb-rcdf-rj@nic.in"
+    # Empty means allow all senders (all suppliers/vendors and tender notices).
+    email_sync_allowed_senders: str = ""
 
     # Optionally configure multiple email accounts to sync. Format: entries separated by ';'
     # each entry is 'email|password' or 'email|password|mailbox' or 'email|password|mailbox|host'.
@@ -53,7 +54,7 @@ class Settings(BaseSettings):
 
     # Allow extra environment variables (some deployments set extra keys)
     model_config = {
-        'env_file': '.env',
+        'env_file': ('.env', 'backend/.env'),
         'case_sensitive': False,
         'extra': 'ignore'
     }

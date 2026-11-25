@@ -1350,6 +1350,11 @@ async def sync_email_pending_ingests(
                 attachments_skipped=skipped_in_msg,
                 note=msg_note,
             )
+            # Commit each processed message and its ingests immediately so rows appear in real-time
+            try:
+                db.commit()
+            except Exception as ce:
+                log.warning("Incremental commit failed for uid=%s: %s", uid, ce)
 
             if mark_seen and unread_only and created_in_msg > 0:
                 try:

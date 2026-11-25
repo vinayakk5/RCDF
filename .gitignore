@@ -73,4 +73,17 @@ test.exe
 Book1.xlsx
 File1.xls
 "WhatsApp Image*"
-backend/whatsapp_bridge/auth_baileys_session/
+backend/whatsapp_bridge/auth_baileys_*/
+backend/whatsapp_bridge/*.bak*
+backend/whatsapp_bridge/dump_msg.js
+*.bak
+*.bak.*
+old_bridge.js
+
+# ── Database backups & raw binaries ─────────────────────────────────────────
+*.sql
+*.zip
+*.pdf
+Tender_Prep_*/
+**/Tender_Prep_*/**
+**/captcha_images/**

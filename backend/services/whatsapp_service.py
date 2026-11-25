@@ -86,9 +86,12 @@ async def handle_whatsapp_webhook(payload: dict, db: Session) -> Dict[str, Any]:
             return {"status": "ignored", "reason": "integration_disabled"}
         
         whitelisted = config.whitelisted_jids or []
-        if whitelisted and len(whitelisted) > 0:
-            if chat_jid not in whitelisted and sender_jid not in whitelisted:
-                log.info(f"[WhatsApp] Chat {chat_jid} / {sender_jid} is NOT in whitelist. Skipping.")
+        if whitelisted and len(whitelisted) > 0 and not has_media:
+            norm_jids = [j.split('@')[0].replace('+', '').strip() for j in whitelisted if j]
+            s_phone = (sender_phone or "").replace('+', '').strip()
+            phone_match = any((s_phone.endswith(nj) or nj.endswith(s_phone)) for nj in norm_jids if nj)
+            if chat_jid not in whitelisted and sender_jid not in whitelisted and not phone_match:
+                log.info(f"[WhatsApp] Chat {chat_jid} / {sender_jid} is NOT in whitelist and has no media. Skipping.")
                 return {"status": "ignored", "reason": "not_whitelisted"}
 
     auto_reply_enabled = config.auto_reply if config else True
@@ -101,11 +104,24 @@ async def handle_whatsapp_webhook(payload: dict, db: Session) -> Dict[str, Any]:
         log.info(f"WhatsApp message {message_id} already processed. Skipping.")
         return {"status": "duplicate", "log_id": existing_log.id, "pending_id": existing_log.matched_id}
 
-    # Resolve default/active company context
-    active_company = db.execute(
-        select(Company).where(Company.is_active == True).order_by(Company.id.asc())
-    ).scalars().first()
-    company_id = active_company.id if active_company else None
+    # Resolve company context based on WhatsApp multi-session ID or active default
+    session_id = payload.get("session_id")
+    company_id = None
+    if session_id == "wa_1":
+        comp = db.execute(select(Company).where(Company.name.ilike("%Shree Nath%"))).scalar_one_or_none()
+        if comp: company_id = comp.id
+    elif session_id == "wa_2":
+        comp = db.execute(select(Company).where(Company.name.ilike("%Shree Vinayak%"))).scalar_one_or_none()
+        if comp: company_id = comp.id
+    elif session_id == "wa_3":
+        comp = db.execute(select(Company).where(Company.name.ilike("%Shree Ganpati%"))).scalar_one_or_none()
+        if comp: company_id = comp.id
+
+    if not company_id:
+        active_company = db.execute(
+            select(Company).where(Company.is_active == True).order_by(Company.id.asc())
+        ).scalars().first()
+        company_id = active_company.id if active_company else None
 
     # Determine Document Classification & Extraction
     doc_type = "purchase_bill"

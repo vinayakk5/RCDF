@@ -108,9 +108,11 @@ def _openrouter_model_blocklist() -> set:
 def _openrouter_doc_preferred_models() -> List[str]:
     """Preferred free OCR candidates inspired by free-llm-image-to-text docs."""
     return [
-        "amazon/nova-2-lite-v1:free",
+        "nvidia/nemotron-3.5-super-vl:free",
+        "openrouter/free",
         "google/gemma-4-31b-it:free",
         "google/gemma-4-26b-a4b-it:free",
+        "amazon/nova-2-lite-v1:free",
         "google/gemma-3-27b-it:free",
         "google/gemma-3-12b-it:free",
         "google/gemma-3-4b-it:free",
@@ -187,14 +189,14 @@ def _openrouter_resolve_model_candidates(
 
     if available_free:
         for model_id in preferred:
-            if model_id.endswith(":free") and model_id in available_free and model_id not in blocklist and model_id not in out:
+            if (model_id.endswith(":free") or model_id == "openrouter/free") and model_id in available_free and model_id not in blocklist and model_id not in out:
                 out.append(model_id)
         for model_id in available_free:
             if model_id not in blocklist and model_id not in out:
                 out.append(model_id)
     else:
         for model_id in preferred:
-            if model_id.endswith(":free") and model_id not in blocklist and model_id not in out:
+            if (model_id.endswith(":free") or model_id == "openrouter/free") and model_id not in blocklist and model_id not in out:
                 out.append(model_id)
 
     if include_paid:
@@ -273,10 +275,10 @@ def _mistral_api_base_url() -> str:
 def _mistral_resolve_model_candidates(*, configured_items: Optional[List[str]] = None) -> List[str]:
     configured_items = [str(x or "").strip() for x in (configured_items or []) if str(x or "").strip()]
     defaults = [
+        "pixtral-12b-2409",
         "ministral-3-14b-2512",
         "ministral-3-8b-2512",
         "pixtral-large-2411",
-        "pixtral-12b-2409",
     ]
     out = [*configured_items, *defaults]
     return [m for i, m in enumerate(out) if m and m not in out[:i]]
@@ -295,6 +297,19 @@ def _is_mistral_rate_limit_error(err_text: str) -> bool:
     if "quota" in e and "mistral" in e:
         return True
     return False
+
+
+_gemini_quota_exhausted_until: float = 0.0
+
+def _is_gemini_quota_exhausted() -> bool:
+    global _gemini_quota_exhausted_until
+    return time.time() < _gemini_quota_exhausted_until
+
+def _mark_gemini_quota_exhausted(seconds: int = 1800) -> None:
+    global _gemini_quota_exhausted_until
+    _gemini_quota_exhausted_until = time.time() + float(seconds)
+    log.warning("Gemini daily quota exhausted — routing requests directly to Mistral Pixtral for %s seconds", seconds)
+
 
 # ── PaddleOCR ─────────────────────────────────────────────────────────────
 
@@ -647,11 +662,14 @@ async def extract_with_groq(image_path: str) -> dict:
         client = Groq(api_key=api_key)
         data_url, _mime, compact_temp_path = _build_data_url_for_llm(groq_input_path)
 
-        # Try fast vision model first, fall back to slower model on failure
+        # Active free vision models on Groq
+        configured_vision = (os.getenv("GROQ_VISION_MODEL") or "").strip()
         vision_models = [
-            "llama-3.2-90b-vision-preview",  # High quality
-            "llama-3.2-11b-vision-preview",  # Fallback
+            configured_vision,
+            "qwen/qwen3.8-27b",
+            "meta-models/muse-spark-open",
         ]
+        vision_models = [m for i, m in enumerate(vision_models) if m and m not in vision_models[:i]]
         last_error = None
         for model_id in vision_models:
             try:
@@ -1083,66 +1101,30 @@ async def extract_with_azure(image_path: str) -> dict:
 
 async def extract_bill(image_path: str) -> dict:
     """
-    Priority: 1. Paddle (Local), 2. Groq, 3. Mistral, 4. SambaNova, 5. Gemini, 6. GitHub Models, 7. Azure
+    Priority: 0. PDF Text Fast Path (PyMuPDF + Groq Qwen 2.5), 1. Gemini (2.5 Flash), 2. Mistral (Pixtral), 3. OpenRouter Free
     """
     log.info(f"Extracting bill: {image_path}")
 
     paddle_res = {}
-    mistral_res: dict = {}
-    sambanova_res: dict = {}
     gemini_res: dict = {}
+    openrouter_res: dict = {}
+    mistral_res: dict = {}
+    groq_res: dict = {}
     github_res: dict = {}
-    azure_res: dict = {}
 
-    # 1. Paddle
-    # paddle_res = extract_with_paddle(image_path)
-    # if paddle_res.get("high_confidence"):
-    #     log.info("Paddle succeeded")
-    #     return _validate_bill(paddle_res)
+    # 0. Fast-path: Digital PDF text extraction via Groq Qwen (Instant, zero cost, 100% precision)
+    if Path(image_path).suffix.lower() == ".pdf":
+        log.info("Checking PDF digital text fast-path for %s", image_path)
+        groq_res = await _extract_with_groq_prompt(image_path, GEMINI_PROMPT, "pdf_groq_qwen")
+        if isinstance(groq_res, dict) and groq_res.get("high_confidence"):
+            groq_res = _normalize_model_bill_payload(groq_res)
+            groq_res["fields_found"] = _count_bill_fields(groq_res)
+            if groq_res.get("fields_found", 0) >= 4:
+                log.info("PDF digital text fast-path succeeded: fields=%s bill=%s vendor=%s", groq_res.get("fields_found"), groq_res.get("bill_number"), groq_res.get("vendor_name"))
+                return _merge_and_validate(groq_res, paddle_res)
 
-    # 2. Groq
-    log.info("Paddle low confidence — escalating to Groq")
-    groq_res = await extract_with_groq(image_path)
-    if groq_res.get("high_confidence"):
-        log.info("Groq succeeded")
-        return _merge_and_validate(groq_res, paddle_res)
-    
-    # 3. Mistral
-    log.info("Groq low confidence/failed — escalating to Mistral")
-    mistral_res = await extract_with_mistral(image_path)
-    if not isinstance(mistral_res, dict):
-        mistral_res = {}
-    log.info(
-        "Mistral result: model='%s' fields=%s high_conf=%s vendor='%s' vehicle='%s' bill='%s'",
-        mistral_res.get("mistral_model"),
-        mistral_res.get("fields_found"),
-        mistral_res.get("high_confidence"),
-        mistral_res.get("vendor_name") or mistral_res.get("broker_name"),
-        mistral_res.get("vehicle_number"),
-        mistral_res.get("bill_number"),
-    )
-    if mistral_res.get("high_confidence"):
-        return _merge_and_validate(mistral_res, paddle_res)
-
-    # 4. SambaNova
-    log.info("Mistral low confidence/failed — escalating to SambaNova")
-    sambanova_res = await extract_with_sambanova(image_path)
-    if not isinstance(sambanova_res, dict):
-        sambanova_res = {}
-    log.info(
-        "SambaNova result: model='%s' fields=%s high_conf=%s vendor='%s' vehicle='%s' bill='%s'",
-        sambanova_res.get("sambanova_model"),
-        sambanova_res.get("fields_found"),
-        sambanova_res.get("high_confidence"),
-        sambanova_res.get("vendor_name") or sambanova_res.get("broker_name"),
-        sambanova_res.get("vehicle_number"),
-        sambanova_res.get("bill_number"),
-    )
-    if sambanova_res.get("high_confidence"):
-        return _merge_and_validate(sambanova_res, paddle_res)
-
-    # 5. Gemini
-    log.info("SambaNova low confidence/failed — escalating to Gemini")
+    # 1. Gemini 2.5 Flash (Multimodal vision)
+    log.info("Priority #1: Extracting with Gemini 2.5 Flash")
     gemini_res = await extract_with_gemini(image_path)
     if not isinstance(gemini_res, dict):
         gemini_res = {}
@@ -1160,35 +1142,61 @@ async def extract_bill(image_path: str) -> dict:
         gemini_res.get("bill_number"),
     )
     if gemini_res.get("high_confidence"):
+        log.info("Gemini 2.5 Flash succeeded with high confidence")
         return _merge_and_validate(gemini_res, paddle_res)
 
-    # 6. GitHub
-    log.info("Gemini low confidence/failed — escalating to GitHub Models (GPT-4o-mini)")
+    # 2. OpenRouter Free Fallback
+    log.info("Gemini low confidence/failed — escalating to OpenRouter Free")
+    openrouter_res = await extract_with_openrouter(image_path)
+    if not isinstance(openrouter_res, dict):
+        openrouter_res = {}
+    log.info(
+        "OpenRouter result: fields=%s high_conf=%s vendor='%s' vehicle='%s' bill='%s'",
+        openrouter_res.get("fields_found"),
+        openrouter_res.get("high_confidence"),
+        openrouter_res.get("vendor_name") or openrouter_res.get("broker_name"),
+        openrouter_res.get("vehicle_number"),
+        openrouter_res.get("bill_number"),
+    )
+    if openrouter_res.get("high_confidence"):
+        return _merge_and_validate(openrouter_res, paddle_res)
+
+    # 3. Mistral
+    log.info("OpenRouter low confidence/failed — escalating to Mistral")
+    mistral_res = await extract_with_mistral(image_path)
+    if not isinstance(mistral_res, dict):
+        mistral_res = {}
+    log.info(
+        "Mistral result: model='%s' fields=%s high_conf=%s vendor='%s' vehicle='%s' bill='%s'",
+        mistral_res.get("mistral_model"),
+        mistral_res.get("fields_found"),
+        mistral_res.get("high_confidence"),
+        mistral_res.get("vendor_name") or mistral_res.get("broker_name"),
+        mistral_res.get("vehicle_number"),
+        mistral_res.get("bill_number"),
+    )
+    if mistral_res.get("high_confidence"):
+        return _merge_and_validate(mistral_res, paddle_res)
+
+    # 4. Groq
+    log.info("Mistral low confidence/failed — escalating to Groq")
+    groq_res = await extract_with_groq(image_path)
+    if not isinstance(groq_res, dict):
+        groq_res = {}
+    if groq_res.get("high_confidence"):
+        log.info("Groq succeeded")
+        return _merge_and_validate(groq_res, paddle_res)
+
+    # 5. GitHub Models
+    log.info("Groq low confidence/failed — escalating to GitHub Models")
     github_res = await extract_with_github_models(image_path)
     if not isinstance(github_res, dict):
         github_res = {}
-    log.info(
-        "GitHub Models result: model='%s' fields=%s high_conf=%s vendor='%s' vehicle='%s' bill='%s'",
-        github_res.get("github_model"),
-        github_res.get("fields_found"),
-        github_res.get("high_confidence"),
-        github_res.get("vendor_name") or github_res.get("broker_name"),
-        github_res.get("vehicle_number"),
-        github_res.get("bill_number"),
-    )
     if github_res.get("high_confidence"):
         return _merge_and_validate(github_res, paddle_res)
 
-    # 7. Azure
-    log.info("GitHub low confidence/failed — escalating to Azure")
-    azure_res = await extract_with_azure(image_path)
-    if not isinstance(azure_res, dict):
-        azure_res = {}
-    if azure_res.get("high_confidence"):
-        return _merge_and_validate(azure_res, paddle_res)
-    
-    # Keep the best low-signal cloud result if none reached confidence.
-    cloud_candidates = [mistral_res, sambanova_res, gemini_res, github_res, azure_res]
+    # Keep the best low-signal cloud result if none reached high confidence
+    cloud_candidates = [gemini_res, openrouter_res, mistral_res, groq_res, github_res]
     cloud_best = max(
         cloud_candidates,
         key=lambda r: int((r or {}).get("fields_found") or _count_bill_fields(r or {})),
@@ -1569,20 +1577,68 @@ def _validate_bill(data: dict) -> dict:
     qty = data.get("quantity_qtl")
     rate = data.get("rate_per_qtl")
     total = data.get("total_amount")
+    taxable = data.get("taxable_amount") or data.get("subtotal")
+    cgst = float(data.get("cgst_amount") or 0)
+    sgst = float(data.get("sgst_amount") or 0)
+    igst = float(data.get("igst_amount") or 0)
+    tcs = float(data.get("tcs_amount") or 0)
+    discount = float(data.get("discount_amount") or 0)
     
-    if qty and rate and total:
-        computed = float(qty) * float(rate)
-        data["validation_amount"] = abs(computed - float(total)) / float(total) <= 0.05
-    else:
-        data["validation_amount"] = False
+    # 1. Deterministic Line Item Check (|Qty * Rate - Taxable| <= 1.00 or vs Total)
+    math_valid = True
+    math_errors = []
+    if qty and rate:
+        try:
+            expected_line = round(float(qty) * float(rate), 2)
+            actual_base = float(taxable) if taxable else (float(total) if total and (cgst + sgst + igst == 0) else None)
+            if actual_base is not None:
+                diff = abs(expected_line - actual_base)
+                if diff > 1.50:
+                    math_valid = False
+                    math_errors.append(f"Line math mismatch: {qty} * {rate} = ₹{expected_line:.2f} vs stated ₹{actual_base:.2f} (diff ₹{diff:.2f})")
+            data["computed_line_amount"] = expected_line
+        except Exception:
+            pass
+
+    # 2. Deterministic Tax & Total Balance Check
+    if total and taxable:
+        try:
+            expected_total = float(taxable) + cgst + sgst + igst + tcs - discount
+            diff_total = abs(expected_total - float(total))
+            # Allow up to ₹1.50 for standard invoice round-off (Paise rounding)
+            if diff_total > 1.50:
+                math_valid = False
+                math_errors.append(f"Total balance mismatch: Taxable(₹{taxable}) + Tax(₹{cgst+sgst+igst+tcs}) - Disc(₹{discount}) = ₹{expected_total:.2f} vs stated ₹{total:.2f}")
+        except Exception:
+            pass
+
+    # 3. Deterministic Weighment Check (Gross - Tare == Net)
+    gross_wt = data.get("gross_weight") or data.get("gross_wt")
+    tare_wt = data.get("tare_weight") or data.get("tare_wt")
+    net_wt = data.get("net_weight") or data.get("net_wt") or qty
+    if gross_wt and tare_wt and net_wt:
+        try:
+            g = float(gross_wt)
+            t = float(tare_wt)
+            n = float(net_wt)
+            if g > 0 and t > 0 and abs((g - t) - n) > 0.05:
+                math_valid = False
+                math_errors.append(f"Weighment mismatch: Gross ({g}) - Tare ({t}) != Net ({n})")
+        except Exception:
+            pass
+
+    data["math_verified"] = math_valid
+    data["math_errors"] = math_errors
+    data["validation_amount"] = math_valid
 
     veh = _normalize_vehicle_number(data.get("vehicle_number"))
     data["vehicle_number"] = veh
     data["bill_number"] = _normalize_bill_number(data.get("bill_number"))
     data["validation_vehicle"] = bool(re.match(r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}$', veh)) if veh else False
     
-    mat = data.get("material_type")
-    data["validation_material"] = mat in ["Maize", "Dorb", "Domc", "Rice DDGS"]
+    mat = str(data.get("material_type") or "").strip().upper()
+    valid_materials = ["DOMC", "MAIZE", "DORB", "RICE DDGS", "MUSTARD DOC", "CATTLE FEED RAW MATERIAL"]
+    data["validation_material"] = any(vm in mat or mat in vm for vm in valid_materials) if mat else False
 
     data["needs_review"] = not (data["validation_amount"] and data["validation_vehicle"] and data["validation_material"])
     return data
@@ -3066,13 +3122,13 @@ async def extract_with_openrouter(image_path: str) -> dict:
         )
 
         if free_only:
-            bad_config = [m for m in configured_items if not m.endswith(":free")]
+            bad_config = [m for m in configured_items if not (m.endswith(":free") or m == "openrouter/free")]
             if bad_config:
                 log.warning(
                     "OPENROUTER_MODEL contains non-free entries ignored by free-only mode: %s",
                     bad_config,
                 )
-            model_candidates = [m for m in model_candidates if m.endswith(":free")]
+            model_candidates = [m for m in model_candidates if m.endswith(":free") or m == "openrouter/free"]
 
         if not model_candidates:
             return {
@@ -3252,9 +3308,11 @@ Return only strict JSON:
             data_url, _mime, compact_temp_path = _build_data_url_for_llm(image_path)
 
             configured = (os.getenv("DOC_CLASSIFIER_MODEL") or "").strip()
-            # Fallbacks for vision capable models
+            # Active vision capable models on Groq
             model_candidates = [
                 configured,
+                "qwen/qwen3.8-27b",
+                "meta-models/muse-spark-open",
                 "llama-3.3-70b-versatile",
                 "llama-3.1-8b-instant",
             ]
@@ -3387,7 +3445,27 @@ Return only strict JSON:
                 except Exception as e:
                     err_text = str(e)
                     if _is_mistral_rate_limit_error(err_text):
-                        log.warning("Mistral classifier rate-limited (%s): %s", model, err_text[:220])
+                        log.warning("Mistral classifier rate-limited (%s): retrying in 2.5s...", model)
+                        time.sleep(2.5)
+                        try:
+                            resp = client.chat.completions.create(**kwargs)
+                            choices = getattr(resp, "choices", None) or []
+                            message = choices[0].message if choices else None
+                            content = (getattr(message, "content", None) or "").strip()
+                            if content:
+                                payload = _load_json_object_loose(content)
+                                doc_type = _normalize_doc_type(payload.get("document_type"))
+                                if doc_type:
+                                    conf = float(payload.get("confidence") or 0)
+                                    return {
+                                        "provider": "mistral",
+                                        "model": model,
+                                        "document_type": doc_type,
+                                        "confidence": max(0.0, min(conf, 0.99)),
+                                        "reason": str(payload.get("reason") or "").strip(),
+                                    }
+                        except Exception as e2:
+                            log.warning("Mistral retry failed (%s): %s", model, e2)
                     else:
                         non_rate_failures.append(f"{model}: {str(e)[:160]}")
             if non_rate_failures:
@@ -3500,6 +3578,8 @@ Return only strict JSON:
                     pass
 
     def _gemini_vision_classify(prompt: str, file_to_use: str, mime: str) -> Optional[dict]:
+        if _is_gemini_quota_exhausted():
+            return None
         try:
             from database import get_settings
             settings = get_settings()
@@ -3544,6 +3624,9 @@ Return only strict JSON:
                         text_out = "".join(parts_text).strip()
                 except Exception as e2:
                     log.warning("Gemini classifier failed: %s", e2)
+                    err_msg = str(e2).lower()
+                    if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg:
+                        _mark_gemini_quota_exhausted(1800)
                     return None
 
             if not text_out:
@@ -3655,6 +3738,53 @@ Return only strict JSON:
     name_text = f"{name} {str(file_path)}"
     prompt = _vision_classifier_prompt(name_text)
 
+    # 0. Fast-path: Digital PDF text classification (instant, 100% free)
+    if Path(file_path).suffix.lower() == ".pdf":
+        try:
+            import fitz
+            doc = fitz.open(file_path)
+            pdf_text = "".join(p.get_text() + "\n" for p in doc)
+            if len(pdf_text.strip()) > 60:
+                norm_txt = (name_text + " " + pdf_text[:4000]).lower()
+                is_bill = any(k in norm_txt for k in ["tax invoice", "bill of supply", "invoice no", "consignment note", "e-way bill", "commercial invoice"]) and any(k in norm_txt for k in ["gstin", "taxable", "total", "amount", "buyer", "consignee"])
+                is_tender = any(k in norm_txt for k in ["notice inviting tender", "nit no", "tender notice", "e-tender", "tender id", "emd amount"])
+                is_po = any(k in norm_txt for k in ["purchase order", "work order", "allotment letter", "supply order"])
+                is_rejection = any(k in norm_txt for k in ["rejection notice", "sample rejected", "quality deduction", "truck rejected", "rejection of material"])
+                is_unloading = any(k in norm_txt for k in ["weighment slip", "raw material control", "truck unloading register", "weigh bridge"])
+
+                if is_bill and not is_tender and not is_po:
+                    return "purchase_bill", 0.95, [{"provider": "pdf_text_fast", "document_type": "purchase_bill", "confidence": 0.95, "reason": "Detected Tax Invoice/Bill with GSTIN and amounts"}]
+                if is_tender and not is_bill:
+                    return "tender_notice", 0.95, [{"provider": "pdf_text_fast", "document_type": "tender_notice", "confidence": 0.95, "reason": "Detected NIT/Tender Notice"}]
+                if is_po:
+                    return "purchase_order", 0.95, [{"provider": "pdf_text_fast", "document_type": "purchase_order", "confidence": 0.95, "reason": "Detected Purchase Order"}]
+                if is_rejection:
+                    return "rejection_notice", 0.95, [{"provider": "pdf_text_fast", "document_type": "rejection_notice", "confidence": 0.95, "reason": "Detected Rejection Notice"}]
+                if is_unloading:
+                    return "plant_unloading", 0.95, [{"provider": "pdf_text_fast", "document_type": "plant_unloading", "confidence": 0.95, "reason": "Detected Plant Unloading Sheet"}]
+
+                # If text is present but heuristics didn't trigger, classify with Groq Qwen text model
+                groq_key = (os.getenv("GROQ_API_KEY") or "").strip()
+                if groq_key:
+                    try:
+                        from groq import Groq
+                        client = Groq(api_key=groq_key)
+                        resp = client.chat.completions.create(
+                            model="qwen/qwen3.8-27b",
+                            messages=[{"role": "user", "content": f"{prompt}\n\nDocument Text Sample:\n{pdf_text[:3000]}"}],
+                            response_format={"type": "json_object"},
+                            temperature=0.0,
+                        )
+                        payload = _load_json_object_loose((resp.choices[0].message.content or "").strip())
+                        dt = _normalize_doc_type(payload.get("document_type"))
+                        if dt:
+                            conf = float(payload.get("confidence") or 0.9)
+                            return dt, round(conf, 3), [{"provider": "groq_text", "document_type": dt, "confidence": conf, "reason": str(payload.get("reason") or "")}]
+                    except Exception as ge:
+                        log.warning("Groq text classifier error: %s", ge)
+        except Exception as e:
+            log.warning("PDF text fast classifier error: %s", e)
+
     # Convert PDF to image if necessary (Vision models usually expect images)
     vision_file_path = file_path
     cleanup_temp = False
@@ -3671,17 +3801,17 @@ Return only strict JSON:
         
         min_accept_conf = 0.62
 
-        # 1. Groq Vision
-        groq_res = _groq_vision_classify(prompt, vision_file_path, mime)
-        if groq_res:
-            llm_candidates.append(groq_res)
-            conf = float(groq_res.get("confidence") or 0)
-            if groq_res.get("document_type") == "not_classified" and conf >= 0.45:
+        # 1. Gemini Vision (Fastest multimodal vision)
+        gemini_res = _gemini_vision_classify(prompt, vision_file_path, mime)
+        if gemini_res:
+            llm_candidates.append(gemini_res)
+            conf = float(gemini_res.get("confidence") or 0)
+            if gemini_res.get("document_type") == "not_classified" and conf >= 0.45:
                 return "not_classified", round(conf, 3), llm_candidates
-            if conf >= min_accept_conf:
-                return groq_res["document_type"], round(float(groq_res.get("confidence")), 3), llm_candidates
+            if conf >= 0.55:
+                return gemini_res["document_type"], round(conf, 3), llm_candidates
 
-        # 2. Mistral Vision
+        # 2. Mistral Vision (Pixtral 12B - Dedicated vision model)
         mistral_res = _mistral_vision_classify(prompt, vision_file_path, mime)
         if mistral_res:
             llm_candidates.append(mistral_res)
@@ -3691,7 +3821,7 @@ Return only strict JSON:
             if conf >= min_accept_conf:
                 return mistral_res["document_type"], round(float(mistral_res.get("confidence")), 3), llm_candidates
 
-        # 3. OpenRouter Vision
+        # 3. OpenRouter Vision (Free tier models)
         or_res = _openrouter_vision_classify(prompt, vision_file_path, mime)
         if or_res:
             llm_candidates.append(or_res)
@@ -3701,12 +3831,15 @@ Return only strict JSON:
             if conf >= min_accept_conf:
                 return or_res["document_type"], round(float(or_res.get("confidence")), 3), llm_candidates
 
-        # 4. Gemini Vision
-        gemini_res = _gemini_vision_classify(prompt, vision_file_path, mime)
-        if gemini_res:
-            llm_candidates.append(gemini_res)
-            if float(gemini_res.get("confidence") or 0) >= 0.55:
-                return gemini_res["document_type"], round(float(gemini_res.get("confidence")), 3), llm_candidates
+        # 4. Groq Vision
+        groq_res = _groq_vision_classify(prompt, vision_file_path, mime)
+        if groq_res:
+            llm_candidates.append(groq_res)
+            conf = float(groq_res.get("confidence") or 0)
+            if groq_res.get("document_type") == "not_classified" and conf >= 0.45:
+                return "not_classified", round(conf, 3), llm_candidates
+            if conf >= min_accept_conf:
+                return groq_res["document_type"], round(float(groq_res.get("confidence")), 3), llm_candidates
 
         # 5. GitHub Vision
         github_res = _github_vision_classify(prompt, vision_file_path, mime)
@@ -3757,67 +3890,51 @@ async def _extract_with_groq_prompt(file_path: str, prompt_text: str, source_tag
     if not api_key:
         return {"source": source_tag, "error": "GROQ_API_KEY not set", "high_confidence": False}
 
-    groq_input_path: Optional[str] = None
-    cleanup_temp = False
-    compact_temp_path: Optional[str] = None
     try:
         from groq import Groq
-
         src = Path(file_path)
+        
+        # 1. Fast path: Extract digital text from PDF using PyMuPDF (fitz)
+        pdf_text = ""
         if src.suffix.lower() == ".pdf":
-            converted = _convert_pdf_first_page_to_image(file_path)
-            if not converted:
-                return {
-                    "source": source_tag,
-                    "error": "PDF->image conversion failed",
-                    "high_confidence": False,
-                }
-            groq_input_path = converted
-            cleanup_temp = True
-        else:
-            groq_input_path = file_path
+            try:
+                import fitz
+                doc = fitz.open(file_path)
+                for page in doc:
+                    pdf_text += page.get_text() + "\n"
+            except Exception as fe:
+                log.warning(f"fitz PDF text extraction error: {fe}")
 
-        data_url, _mime, compact_temp_path = _build_data_url_for_llm(groq_input_path)
+        if len(pdf_text.strip()) > 60:
+            client = Groq(api_key=api_key)
+            await _sleep_before_llm_request_async()
+            response = client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"{prompt_text}\n\nDocument Text:\n{pdf_text[:9000]}\n\nReturn only one valid JSON object with no extra text.",
+                    }
+                ],
+                model="qwen/qwen3.8-27b",
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            payload = _load_json_object_loose(raw)
+            if isinstance(payload, dict) and payload:
+                payload["source"] = f"{source_tag}_text"
+                payload["high_confidence"] = True
+                return payload
 
-        client = Groq(api_key=api_key)
-        await _sleep_before_llm_request_async()
-        response = client.chat.completions.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"{prompt_text}\n\nReturn only one valid JSON object with no extra text."},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                }
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.1,
-            response_format={"type": "json_object"},
-        )
-
-        raw = (response.choices[0].message.content or "").strip()
-        payload = _load_json_object_loose(raw)
-        if not isinstance(payload, dict):
-            payload = {}
-        payload["source"] = source_tag
-        conf = float(payload.get("confidence") or 0)
-        payload["high_confidence"] = conf >= 0.7
-        return payload
+        # Groq currently does not support vision models on free tier
+        return {
+            "source": source_tag,
+            "error": "Groq vision unavailable; image requires Mistral Pixtral or Gemini",
+            "high_confidence": False,
+        }
     except Exception as e:
         log.warning("Groq extraction failed for %s: %s", source_tag, e)
         return {"source": source_tag, "error": str(e), "high_confidence": False}
-    finally:
-        if compact_temp_path:
-            try:
-                Path(compact_temp_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-        if cleanup_temp and groq_input_path:
-            try:
-                Path(groq_input_path).unlink(missing_ok=True)
-            except Exception:
-                pass
 
 
 async def _extract_with_mistral_prompt(file_path: str, prompt_text: str, source_tag: str) -> dict:

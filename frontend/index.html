@@ -5454,6 +5454,7 @@ pages['busy-export'] = {
       <input id="busy-master-file" type="file" accept=".xlsx,.xls" style="display:none" onchange="pages['busy-export'].uploadMaster(this)">
       <button class="btn" onclick="document.getElementById('busy-master-file').click()">Import Busy Party List</button>
       <button class="btn" onclick="pages['busy-export'].load()">Refresh</button>
+      <a href="/api/download/busy-agent-pkg" class="btn" style="border:1px solid #10b981;color:#10b981;font-weight:600;display:inline-flex;align-items:center;gap:4px;" download title="Download lightweight background auto-sync agent for Windows 7 accounting PC">📥 Download Windows 7 Agent</a>
       <button id="busy-export-btn" class="btn btn-primary" onclick="pages['busy-export'].exportSelected()">Export selected Busy XLSX</button>
       <button id="busy-export-clear-btn" class="btn" onclick="pages['busy-export'].clearSelection()">Clear selection</button>`, `busy-export:${this.sort}`);
 
@@ -5476,6 +5477,19 @@ pages['busy-export'] = {
       const exportedCount = state.busyExportRows.filter(r => r.busy_exported).length;
 
       el.innerHTML = `
+                <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);border-radius:8px;padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+          <div>
+            <strong style="color:var(--text);font-size:13px;">⚡ Dual Busy Import Modes:</strong>
+            <span style="font-size:12px;color:var(--muted);margin-left:8px;">
+              <b>Option A (Automatic):</b> Run the Windows 7 Agent to auto-place approved bills into <code>C:\BusyWin\Import\Book1.xlsx</code>. &bull; 
+              <b>Option B (Manual):</b> Select bills below &amp; click <b>Export selected Busy XLSX</b>.
+            </span>
+          </div>
+          <a href="/api/download/busy-agent-pkg" class="btn btn-sm" style="background:#10b981;color:#fff;font-weight:600;display:inline-flex;align-items:center;gap:6px;" download>
+            📥 Download Windows 7 Agent (.zip)
+          </a>
+        </div>
+
         <div class="stats-grid" style="grid-template-columns:repeat(3,1fr)">
           <div class="stat-card"><div class="stat-n">${state.busyExportRows.length}</div><div class="stat-l">Busy-ready purchase bills</div></div>
           <div class="stat-card"><div class="stat-n num">${totalQty.toFixed(1)}</div><div class="stat-l">Total qty (Qtl)</div></div>
@@ -5894,6 +5908,7 @@ pages['busy-staging'] = {
       <button class="btn" onclick="pages['busy-staging'].load()">Refresh</button>
       <button id="busy-staging-reparse-btn" class="btn" onclick="pages['busy-staging'].reparseSelected()">Reparse selected</button>
       <button id="busy-staging-delete-btn" class="btn" onclick="pages['busy-staging'].deleteSelected()">Delete selected</button>
+      <a href="/api/download/busy-agent-pkg" class="btn" style="border:1px solid #10b981;color:#10b981;font-weight:600;display:inline-flex;align-items:center;gap:4px;" download title="Download lightweight background auto-sync agent for Windows 7 accounting PC">📥 Download Windows 7 Agent</a>
       <button id="busy-staging-export-btn" class="btn btn-primary" onclick="pages['busy-staging'].exportSelected()">Export selected Busy XLSX</button>
       <button id="busy-staging-clear-btn" class="btn" onclick="pages['busy-staging'].clearSelection()">Clear selection</button>`, `busy-staging:${this.sort}:${this.includeExported ? '1' : '0'}`);
 
@@ -5916,6 +5931,19 @@ pages['busy-staging'] = {
       const exportedCount = state.busyStagingRows.filter(r => r.busy_exported).length;
 
       el.innerHTML = `
+                <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);border-radius:8px;padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+          <div>
+            <strong style="color:var(--text);font-size:13px;">⚡ Dual Busy Import Modes:</strong>
+            <span style="font-size:12px;color:var(--muted);margin-left:8px;">
+              <b>Option A (Automatic):</b> Run the Windows 7 Agent to auto-place approved bills into <code>C:\BusyWin\Import\Book1.xlsx</code>. &bull; 
+              <b>Option B (Manual):</b> Select bills below &amp; click <b>Export selected Busy XLSX</b>.
+            </span>
+          </div>
+          <a href="/api/download/busy-agent-pkg" class="btn btn-sm" style="background:#10b981;color:#fff;font-weight:600;display:inline-flex;align-items:center;gap:6px;" download>
+            📥 Download Windows 7 Agent (.zip)
+          </a>
+        </div>
+
         <div class="stats-grid" style="grid-template-columns:repeat(3,1fr)">
           <div class="stat-card"><div class="stat-n">${state.busyStagingRows.length}</div><div class="stat-l">Staged bills</div></div>
           <div class="stat-card"><div class="stat-n num">${totalQty.toFixed(1)}</div><div class="stat-l">Total qty (Qtl)</div></div>

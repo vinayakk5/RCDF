@@ -11,9 +11,9 @@ from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
 from io import BytesIO
 import time
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func, and_, or_, desc, text
@@ -586,9 +586,12 @@ def _email_sync_runs_per_day() -> int:
 
 
 def _email_sync_interval_seconds() -> int:
-    runs = _email_sync_runs_per_day()
-    # 3/day ~= 8h, 4/day ~= 6h
-    return max(1800, int(86400 / runs))
+    settings = get_settings()
+    custom_interval = getattr(settings, "email_sync_interval_seconds", None)
+    if custom_interval and int(custom_interval) > 0:
+        return max(30, int(custom_interval))
+    # Default continuous loop interval: 180 seconds (3 minutes)
+    return 180
 
 
 _email_sync_lock = asyncio.Lock()
@@ -608,8 +611,8 @@ async def _run_email_sync_once(reason: str = "auto") -> dict:
         return {"ok": False, "reason": reason, "skipped": "email credentials not configured"}
 
     limit = max(1, min(int(settings.email_sync_limit or 80), 400))
-    # Auto-sync should scan both read and unread emails.
-    unread_only = False
+    # Strictly respect unread_only setting (default True = UNSEEN messages only)
+    unread_only = bool(settings.email_sync_unread_only)
     mark_seen = bool(settings.email_sync_mark_seen)
 
     with SessionLocal() as db:
@@ -650,9 +653,17 @@ async def _run_email_sync_once(reason: str = "auto") -> dict:
         return result
 
 
+def _run_email_sync_once_blocking(reason: str) -> dict:
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_run_email_sync_once(reason=reason))
+    finally:
+        loop.close()
+
+
 async def _run_email_sync_once_locked(reason: str = "auto") -> dict:
     async with _email_sync_lock:
-        return await _run_email_sync_once(reason=reason)
+        return await asyncio.to_thread(_run_email_sync_once_blocking, reason)
 
 
 async def _email_sync_scheduler_loop(stop_event: asyncio.Event) -> None:
@@ -2104,8 +2115,6 @@ def _suggest_busy_party(
     q = select(BusyPartyMaster).where(BusyPartyMaster.is_active == True)
     if company_id is not None:
         q = q.where(or_(BusyPartyMaster.company_id == company_id, BusyPartyMaster.company_id == None))
-    else:
-        q = q.where(BusyPartyMaster.company_id == None)
 
     rows = db.execute(q).scalars().all()
     if not rows:
@@ -7250,12 +7259,14 @@ def ingest_email_config(db: Session = Depends(get_db)):
 @app.post("/api/ingest/email/sync")
 async def sync_ingest_from_email(
     limit: Optional[int] = Query(None, ge=0, le=2000),
-    since_days: Optional[int] = Query(None, ge=0, le=180),
+    since_days: Optional[int] = Query(None, ge=0, le=365),
     unread_only: Optional[bool] = Query(None),
     mark_seen: Optional[bool] = Query(None),
     mailbox: Optional[str] = Query(None),
     email_account: Optional[str] = Query(None),
     use_checkpoint: bool = Query(False),
+    ignore_duplicates: bool = Query(False),
+    ignore_sender_allowlist: bool = Query(True),
     db: Session = Depends(get_db),
 ):
     from services.email_sync_service import (
@@ -7275,7 +7286,7 @@ async def sync_ingest_from_email(
     selected_all_accounts = not requested_account_norm or requested_account_norm in {"all", "*"}
 
     limit_value = int(limit if limit is not None else (settings.email_sync_limit or 80))
-    since_days_value = int(since_days if since_days is not None else 14)
+    since_days_value = int(since_days if since_days is not None else 30)
     unread_only_value = bool(unread_only if unread_only is not None else settings.email_sync_unread_only)
     mark_seen_value = bool(mark_seen if mark_seen is not None else settings.email_sync_mark_seen)
 
@@ -7290,7 +7301,8 @@ async def sync_ingest_from_email(
                     mark_seen=mark_seen_value,
                     start_uid=None,
                     update_checkpoint=use_checkpoint,
-                    ignore_duplicates=False,
+                    ignore_duplicates=ignore_duplicates,
+                    ignore_sender_allowlist=ignore_sender_allowlist,
                     sync_reason="manual",
                 )
             else:
@@ -7316,7 +7328,8 @@ async def sync_ingest_from_email(
                     mailbox=mailbox_value,
                     start_uid=start_uid,
                     update_checkpoint=use_checkpoint,
-                    ignore_duplicates=False,
+                    ignore_duplicates=ignore_duplicates,
+                    ignore_sender_allowlist=ignore_sender_allowlist,
                     email_user_override=str(target.get("email_user") or ""),
                     email_pass_override=str(target.get("email_pass") or ""),
                     host_override=str(target.get("host") or settings.email_host or "imap.gmail.com"),
@@ -9249,8 +9262,6 @@ def list_busy_master_parties(
     q = select(BusyPartyMaster).where(BusyPartyMaster.is_active == True)
     if company_id is not None:
         q = q.where(or_(BusyPartyMaster.company_id == company_id, BusyPartyMaster.company_id == None))
-    else:
-        q = q.where(BusyPartyMaster.company_id == None)
 
     rows = db.execute(q).scalars().all()
     if company_id is not None:
@@ -9547,6 +9558,134 @@ def export_purchase_bills_busy_xlsx(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=busy_purchase_bills.xlsx"},
+    )
+
+
+@app.get("/api/export/purchase-bills/busy-xlsx")
+def export_purchase_bills_busy_xlsx_get(
+    ids: Optional[str] = Query(None),
+    company_id: Optional[int] = Query(None),
+    main_tender_id: Optional[int] = Query(None),
+    tender_id: Optional[int] = Query(None),
+    include_exported: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """
+    GET endpoint for Busy XLSX export.
+    Supports manual export via ?ids=1,2,3 OR automated background polling by the Windows 7 Agent.
+    When ids is omitted, exports all ready (unexported) purchase bills for the company.
+    """
+    from services.busy_export import export_busy_purchase_bills_xlsx, save_export_bytes
+
+    only_ids = None
+    if ids:
+        only_ids = {int(x) for x in ids.split(",") if x.strip() and x.strip().isdigit()}
+
+    rows, _ = _collect_busy_ready_bill_rows(
+        db,
+        company_id=company_id,
+        main_tender_id=main_tender_id,
+        tender_id=tender_id,
+        include_exported=include_exported,
+        only_bill_ids=only_ids,
+    )
+
+    if not rows:
+        raise HTTPException(404, "No ready purchase bills found for Busy export")
+
+    export_rows = []
+    for r in rows:
+        export_rows.append({
+            "vch_series": r.get("vch_series", "Main"),
+            "vch_bill_date": r.get("vch_bill_date"),
+            "vch_bill_no": r.get("vch_bill_no"),
+            "sale_purc_type": r.get("sale_purc_type"),
+            "party_name": r.get("party_name"),
+            "mc_name": r.get("mc_name", "Main Store"),
+            "item_name": r.get("item_name"),
+            "quantity": r.get("quantity"),
+            "unit": r.get("unit", "QUINTAL"),
+            "price": r.get("price_value"),
+            "itc_eligibility_type": r.get("itc_eligibility_type", "Input Goods/Services"),
+            "narration": r.get("narration"),
+        })
+
+    settings = get_settings()
+    content = export_busy_purchase_bills_xlsx(export_rows)
+
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=Book1.xlsx"},
+    )
+
+
+@app.get("/api/download/busy-agent-pkg")
+def download_busy_agent_package(request: Request):
+    """
+    Download a self-contained ZIP package for Windows 7 accounting PC:
+    Includes busy_win7_agent.py, preconfigured busy_agent_config.json, run_busy_agent.bat, and README.txt.
+    """
+    import zipfile
+    from io import BytesIO
+
+    base_url = str(request.base_url).rstrip("/")
+    # Read agent script and files from tools directory
+    tools_dir = Path(__file__).resolve().parent.parent / "tools"
+    agent_py = (tools_dir / "busy_win7_agent.py").read_text(encoding="utf-8") if (tools_dir / "busy_win7_agent.py").exists() else "# Busy Agent"
+    bat_file = (tools_dir / "run_busy_agent.bat").read_text(encoding="utf-8") if (tools_dir / "run_busy_agent.bat").exists() else "@echo off\npython busy_win7_agent.py\npause"
+    
+    config_dict = {
+        "server_url": base_url,
+        "company_id": 2,
+        "company_name": "Shree Nath Industries",
+        "busy_import_dir": "C:\\BusyWin\\Import",
+        "import_filename": "Book1.xlsx",
+        "poll_interval_seconds": 60,
+        "auto_backup": True,
+        "api_key": ""
+    }
+
+    readme_text = f"""========================================================================
+ RCDF Operations Platform — Windows 7 Busy Auto-Import Agent
+========================================================================
+
+QUICK 3-STEP SETUP FOR ACCOUNTING PC:
+
+Step 1: Unzip this entire folder to your PC, e.g. C:\\RCDF_Busy_Agent\\
+Step 2: Double-click 'run_busy_agent.bat' to start the agent.
+Step 3: The agent runs quietly in the background (< 10 MB RAM).
+        Whenever purchase bills are approved on the RCDF platform,
+        it automatically saves the latest verified 'Book1.xlsx'
+        directly into:
+        C:\\BusyWin\\Import\\Book1.xlsx
+
+HOW TO IMPORT INTO BUSY ACCOUNTING:
+1. Open Busy Accounting Software.
+2. Select your Company (e.g. SHREE NATH INDUSTRIES 26-27).
+3. Navigate to:
+   Administration -> Data Export/Import -> Import Vouchers from Excel.
+4. Select Voucher Type: Purchase
+5. Click 'Import' -> In under 3 seconds, all vouchers are entered!
+
+Configuration:
+If your server address or Busy folder is different, edit 'busy_agent_config.json'.
+Current Server: {base_url}
+========================================================================
+"""
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("busy_win7_agent.py", agent_py)
+        zf.writestr("busy_agent_config.json", json.dumps(config_dict, indent=4))
+        zf.writestr("run_busy_agent.bat", bat_file)
+        zf.writestr("README.txt", readme_text)
+
+    buf.seek(0)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=RCDF_Busy_Agent_Windows7.zip"}
     )
 
 
@@ -10120,6 +10259,9 @@ async def get_whatsapp_status(db: Session = Depends(get_db)):
         "connected": bridge_data.get("connected", False),
         "user": bridge_data.get("user"),
         "has_qr": bridge_data.get("has_qr", False),
+        "sessions": bridge_data.get("sessions", {}),
+        "total_sessions": bridge_data.get("total_sessions", 1),
+        "connected_sessions": bridge_data.get("connected_sessions", 0),
         "config": {
             "is_enabled": config.is_enabled if config else True,
             "auto_reply": config.auto_reply if config else True,
@@ -10130,14 +10272,301 @@ async def get_whatsapp_status(db: Session = Depends(get_db)):
 
 
 @app.get("/api/whatsapp/qr")
-async def get_whatsapp_qr():
+async def get_whatsapp_qr(session: Optional[str] = Query(None)):
     """Proxy live QR code from the WhatsApp bridge for Web UI pairing."""
     try:
+        url = f"{WHATSAPP_BRIDGE_URL}/qr"
+        if session:
+            url += f"?session={session}"
         async with httpx.AsyncClient(timeout=4.0) as client:
-            r = await client.get(f"{WHATSAPP_BRIDGE_URL}/qr")
+            r = await client.get(url)
             return r.json()
     except Exception as e:
         return {"success": False, "connected": False, "error": f"WhatsApp bridge not reachable: {e}"}
+
+
+@app.get("/whatsapp-qr", response_class=HTMLResponse)
+async def whatsapp_qr_view():
+    """Live interactive web view for pairing all 3 WhatsApp accounts."""
+    return HTMLResponse(content="""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WhatsApp Multi-Account Pairing — RCDF Operations</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --green: #22c55e;
+      --amber: #f59e0b;
+      --blue: #38bdf8;
+      --red: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 32px 16px;
+    }
+    .header {
+      text-align: center;
+      max-width: 800px;
+      margin-bottom: 28px;
+    }
+    .header h1 {
+      font-size: 24px;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+    .header p {
+      color: var(--muted);
+      font-size: 14px;
+      margin-top: 8px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+      gap: 20px;
+      width: 100%;
+      max-width: 1100px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      position: relative;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+    }
+    .card-header {
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+    }
+    .card-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: #fff;
+    }
+    .card-id {
+      font-size: 11px;
+      color: var(--muted);
+      font-family: monospace;
+      margin-top: 2px;
+    }
+    .pill {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 9999px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .pill-green { background: rgba(34, 197, 94, 0.15); color: var(--green); border: 1px solid var(--green); }
+    .pill-amber { background: rgba(245, 158, 11, 0.15); color: var(--amber); border: 1px solid var(--amber); }
+    .pill-red { background: rgba(239, 68, 68, 0.15); color: var(--red); border: 1px solid var(--red); }
+    .qr-box {
+      background: #ffffff;
+      border-radius: 10px;
+      width: 220px;
+      height: 220px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 12px 0;
+      padding: 10px;
+      overflow: hidden;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    }
+    .qr-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .connected-box {
+      width: 220px;
+      height: 220px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      margin: 12px 0;
+      background: rgba(34, 197, 94, 0.08);
+      border: 2px dashed var(--green);
+      border-radius: 10px;
+      padding: 16px;
+      text-align: center;
+    }
+    .connected-icon {
+      font-size: 48px;
+      color: var(--green);
+      margin-bottom: 8px;
+    }
+    .connected-phone {
+      font-size: 16px;
+      font-weight: 700;
+      color: #fff;
+      margin-top: 4px;
+    }
+    .instructions {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+      text-align: center;
+      margin-top: 8px;
+    }
+    .btn {
+      margin-top: 14px;
+      padding: 8px 16px;
+      font-size: 12px;
+      font-weight: 600;
+      background: #334155;
+      color: #fff;
+      border: 1px solid #475569;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn:hover { background: #475569; }
+    .footer-note {
+      margin-top: 32px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+    }
+    .footer-note a { color: var(--blue); text-decoration: none; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1><span style="color:#22c55e;">●</span> WhatsApp Multi-Account Pairing Gateway</h1>
+    <p>Link all 3 company WhatsApp accounts simultaneously. Scan the QR code using <b>WhatsApp &gt; Linked Devices &gt; Link a Device</b>.</p>
+  </div>
+
+  <div class="grid">
+    <!-- Account 1 -->
+    <div class="card" id="card-wa_1">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Shree Nath Industries</div>
+          <div class="card-id">Session: wa_1</div>
+        </div>
+        <span class="pill pill-amber" id="pill-wa_1">Checking...</span>
+      </div>
+      <div id="content-wa_1" class="qr-box">
+        <span style="color:#64748b;font-size:12px;">Loading QR...</span>
+      </div>
+      <div class="instructions" id="inst-wa_1">Scan with the WhatsApp account for <b>Shree Nath Industries</b></div>
+      <button class="btn" onclick="fetchSessionQR('wa_1')">🔄 Refresh QR</button>
+    </div>
+
+    <!-- Account 2 -->
+    <div class="card" id="card-wa_2">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Shree Vinayak Trading</div>
+          <div class="card-id">Session: wa_2</div>
+        </div>
+        <span class="pill pill-amber" id="pill-wa_2">Checking...</span>
+      </div>
+      <div id="content-wa_2" class="qr-box">
+        <span style="color:#64748b;font-size:12px;">Loading QR...</span>
+      </div>
+      <div class="instructions" id="inst-wa_2">Scan with the WhatsApp account for <b>Shree Vinayak Trading</b></div>
+      <button class="btn" onclick="fetchSessionQR('wa_2')">🔄 Refresh QR</button>
+    </div>
+
+    <!-- Account 3 -->
+    <div class="card" id="card-wa_3">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Shree Ganpati Enterprises</div>
+          <div class="card-id">Session: wa_3</div>
+        </div>
+        <span class="pill pill-amber" id="pill-wa_3">Checking...</span>
+      </div>
+      <div id="content-wa_3" class="qr-box">
+        <span style="color:#64748b;font-size:12px;">Loading QR...</span>
+      </div>
+      <div class="instructions" id="inst-wa_3">Scan with the WhatsApp account for <b>Shree Ganpati Enterprises</b></div>
+      <button class="btn" onclick="fetchSessionQR('wa_3')">🔄 Refresh QR</button>
+    </div>
+  </div>
+
+  <div class="footer-note">
+    Looking for operations hub? Return to <a href="/">RCDF Operations Dashboard</a>
+  </div>
+
+  <script>
+    async function fetchSessionQR(sessionId) {
+      const pill = document.getElementById(`pill-${sessionId}`);
+      const content = document.getElementById(`content-${sessionId}`);
+      try {
+        const res = await fetch(`/api/whatsapp/qr?session=${sessionId}`);
+        const data = await res.json();
+        
+        if (data.connected) {
+          pill.className = 'pill pill-green';
+          pill.innerText = 'Connected';
+          content.className = 'connected-box';
+          const userPhone = data.user?.id ? data.user.id.split('@')[0] : 'Active';
+          content.innerHTML = `
+            <div class="connected-icon">✓</div>
+            <div style="color:var(--green);font-size:13px;font-weight:600;">Linked Successfully</div>
+            <div class="connected-phone">+${userPhone}</div>
+          `;
+        } else if (data.qr_data_url) {
+          pill.className = 'pill pill-amber';
+          pill.innerText = 'Awaiting Scan';
+          content.className = 'qr-box';
+          content.innerHTML = `<img src="${data.qr_data_url}" alt="WhatsApp QR Code">`;
+        } else {
+          pill.className = 'pill pill-amber';
+          pill.innerText = 'Initializing';
+          content.className = 'qr-box';
+          content.innerHTML = `<span style="color:#64748b;font-size:12px;">${data.error || 'Waiting for QR code...'}</span>`;
+        }
+      } catch (e) {
+        pill.className = 'pill pill-red';
+        pill.innerText = 'Offline';
+        content.className = 'qr-box';
+        content.innerHTML = `<span style="color:#ef4444;font-size:12px;">Bridge unreachable</span>`;
+      }
+    }
+
+    function refreshAll() {
+      ['wa_1', 'wa_2', 'wa_3'].forEach(id => fetchSessionQR(id));
+    }
+
+    refreshAll();
+    // Auto refresh every 5 seconds
+    setInterval(refreshAll, 5000);
+  </script>
+</body>
+</html>
+""")
 
 
 @app.get("/api/whatsapp/groups")

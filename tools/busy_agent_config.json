@@ -1,0 +1,10 @@
+{
+    "server_url": "http://147.93.106.168:8000",
+    "company_id": 2,
+    "company_name": "Shree Nath Industries",
+    "busy_import_dir": "C:\\BusyWin\\Import",
+    "import_filename": "Book1.xlsx",
+    "poll_interval_seconds": 60,
+    "auto_backup": true,
+    "api_key": ""
+}
