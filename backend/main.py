@@ -5744,7 +5744,13 @@ def _ingest_unloading_rows(
             duplicates += 1
             continue
 
-        needs_review = net_qty is None or _norm_code(truck).startswith("unknown")
+        verify_status = row.get("verify_status")
+        needs_review = (
+            net_qty is None
+            or _norm_code(truck).startswith("unknown")
+            # Two readers did not agree on this truck (or a sheet check failed).
+            or (verify_status is not None and verify_status not in ("verified", "confirmed_by_total"))
+        )
         e = PlantUnloadingEntry(
             company_id=master.company_id,
             main_tender_id=master.main_tender_id,
@@ -5765,6 +5771,7 @@ def _ingest_unloading_rows(
             ocr_source=OcrSource.paddle if extracted.get("source") == "paddle" else OcrSource.gemini,
             ocr_confidence=_to_float(extracted.get("confidence") or extracted.get("ocr_confidence")),
             ocr_raw_json=json.dumps({"header": {k: extracted.get(k) for k in ["rm_number", "item_name", "party_name", "plant_name", "po_number"]}, "row": row}, ensure_ascii=False),
+            notes=("Check: " + "; ".join(row.get("verify_reasons") or [])) if needs_review and row.get("verify_reasons") else None,
         )
         db.add(e)
         created_entries.append(e)
@@ -8581,7 +8588,7 @@ async def upload_plant_unloading_sheet(
     tender_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
 ):
-    from services.ocr_service import extract_plant_unloading_sheet
+    from services.ocr_service import extract_plant_unloading_sheet_verified as extract_plant_unloading_sheet
 
     settings = get_settings()
     dest_dir = Path(settings.upload_dir) / "plant_unloading"
@@ -8649,7 +8656,7 @@ async def bulk_upload_plant_unloading_sheet(
     tender_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
 ):
-    from services.ocr_service import extract_plant_unloading_sheet
+    from services.ocr_service import extract_plant_unloading_sheet_verified as extract_plant_unloading_sheet
 
     settings = get_settings()
     dest_dir = Path(settings.upload_dir) / "plant_unloading"

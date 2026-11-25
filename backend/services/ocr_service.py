@@ -1836,7 +1836,10 @@ Extract ALL fields below. Return ONLY a valid JSON object - no markdown, no expl
             "no_of_bags": "Number of bags as numeric value (e.g. 420) or null",
             "received_qty_mt": "Received quantity in QUINTAL (Qtl) as number (legacy key name with _mt) (e.g. 427.000) or null",
             "net_qty_mt": "Net quantity in QUINTAL (Qtl) as number (legacy key name with _mt) (e.g. 419.800) or null",
-            "total_qty_mt": "Running/total quantity in QUINTAL (Qtl) as number (legacy key name with _mt) (e.g. 4205.600) or null"
+            "total_qty_mt": "Running/total quantity in QUINTAL (Qtl) as number (legacy key name with _mt) (e.g. 4205.600) or null",
+            "gross_weight_kg": "Weighbridge GROSS weight in KG exactly as printed, if the sheet has a gross column, else null",
+            "tare_weight_kg": "Weighbridge TARE weight in KG exactly as printed, if the sheet has a tare column, else null",
+            "net_weight_kg": "Weighbridge NET weight in KG exactly as printed, if the sheet shows net in KG, else null"
         }
     ],
     "confidence": "0.0 to 1.0 overall extraction confidence"
@@ -1856,6 +1859,9 @@ Critical rules:
 - Plant name normalization: if text is like "CATTLE FEED PLANT KALADERA" or "CFP KALADERA", extract location as "Kaladera".
 - Accept plant/location variants from this set when clearly present: Kaladera, Bikaner, Jodhpur, Ajmer, Nadbai, Pali, Lambiyan, Bhilwara.
 - If a field is unclear or missing, set it to null.
+- Weighbridge sheets (Kanta parchi / weighment register) usually print Gross, Tare and Net in KG.
+  Copy those KG numbers into gross_weight_kg / tare_weight_kg / net_weight_kg exactly as printed,
+  and ALSO give net_qty_mt in quintals (KG / 100). Never mix KG and quintals in one field.
 - Keep row order exactly as the sheet order.
 - If table borders are faint, infer columns from alignment but do not hallucinate values.
 - If there are no valid rows, return rows as an empty list.
@@ -5074,9 +5080,57 @@ async def _extract_with_prompt_chain(file_path: str, prompt_text: str, doc_type:
     }
 
 
+def _provider_of(source: Optional[str]) -> str:
+    src = str(source or "").lower()
+    for key in ("gemini", "mistral", "groq", "openrouter", "github", "azure"):
+        if src.startswith(key):
+            return key
+    return src
+
+
+async def _second_reading(file_path: str, prompt_text: str, doc_type: str, first_source: Optional[str],
+                          normalize) -> Optional[dict]:
+    """An independent second reading from a different free provider."""
+    first_provider = _provider_of(first_source)
+    for provider in ("gemini", "mistral", "groq", "openrouter"):
+        if provider == first_provider:
+            continue
+        try:
+            res = await _extract_with_prompt_chain(file_path, prompt_text, doc_type, preferred_provider=provider)
+        except Exception as e:  # a failed second reader only lowers confidence
+            log.warning("%s second reader %s failed: %s", doc_type, provider, e)
+            continue
+        if isinstance(res, dict) and not res.get("error"):
+            res = normalize(res)
+            if any(res.get(k) for k in ("tender_rm_number", "po_number", "items", "line_items")):
+                return res
+    return None
+
+
+def _attach_header_verification(first: dict, second: Optional[dict], fields, rate_key=None) -> dict:
+    from services.document_verifier import verify_header_doc
+    v = verify_header_doc(first, second, fields, rate_key=rate_key)
+    first["verification"] = v
+    first["needs_review"] = v["needs_review"]
+    first["review_reasons"] = v["review_reasons"]
+    first["high_confidence"] = not v["needs_review"]
+    first["confidence"] = 1.0 if not v["needs_review"] else min(float(first.get("confidence") or 0.6), 0.6)
+    return first
+
+
+_TENDER_NOTICE_FIELDS = [("tender_rm_number", "code"), ("plant_name", "name"),
+                         ("supply_period_start", "date"), ("supply_period_end", "date")]
+_PO_FIELDS = [("po_number", "code"), ("tender_rm_number", "code"), ("plant_name", "name"),
+              ("supply_period_start", "date"), ("supply_period_end", "date")]
+
+
 async def extract_tender_notice(file_path: str, preferred_provider: Optional[str] = None) -> dict:
     result = await _extract_with_prompt_chain(file_path, TENDER_NOTICE_PROMPT, "tender_notice", preferred_provider=preferred_provider)
     result = _normalize_tender_notice_result(result)
+    if isinstance(result, dict) and not result.get("error"):
+        second = await _second_reading(file_path, TENDER_NOTICE_PROMPT, "tender_notice", result.get("source"),
+                                       _normalize_tender_notice_result)
+        result = _attach_header_verification(result, second, _TENDER_NOTICE_FIELDS)
     result["document_type"] = "tender_notice"
     return result
 
@@ -5084,8 +5138,65 @@ async def extract_tender_notice(file_path: str, preferred_provider: Optional[str
 async def extract_purchase_order_doc(file_path: str, preferred_provider: Optional[str] = None) -> dict:
     result = await _extract_with_prompt_chain(file_path, PURCHASE_ORDER_PROMPT, "purchase_order", preferred_provider=preferred_provider)
     result = _normalize_purchase_order_result(result)
+    if isinstance(result, dict) and not result.get("error"):
+        # The PO sets our sale rate and tender quantities, so its lines are double-checked too.
+        second = await _second_reading(file_path, PURCHASE_ORDER_PROMPT, "purchase_order", result.get("source"),
+                                       _normalize_purchase_order_result)
+        result = _attach_header_verification(result, second, _PO_FIELDS, rate_key="approved_rate_per_qtl")
     result["document_type"] = "purchase_order"
     return result
+
+
+_UNLOADING_PROVIDERS = ("gemini", "mistral", "groq", "github", "azure")
+
+
+async def extract_plant_unloading_sheet_verified(file_path: str, preferred_provider: Optional[str] = None) -> dict:
+    """Read an unloading register / weighbridge sheet twice and compare row by row.
+
+    Excel sheets are parsed locally (no AI), so they are taken as read. For photos
+    and PDFs a second free reader from a different provider must agree on each
+    truck's net quantity, or the sheet's running total must confirm it; otherwise
+    the row is flagged for review instead of creating a receipt silently.
+    """
+    from services.document_verifier import verify_unloading
+
+    first = await extract_plant_unloading_sheet(file_path, preferred_provider=preferred_provider)
+    if Path(file_path).suffix.lower() in {".xlsx", ".xls"} or not isinstance(first, dict) or not first.get("rows"):
+        if isinstance(first, dict):
+            first.setdefault("verification", {"readers": [first.get("source")], "mode": "single"})
+        return first
+    first_provider = _provider_of(first.get("source"))
+    second = None
+    attempts = list(first.get("provider_attempts") or [])
+    for provider in _UNLOADING_PROVIDERS:
+        if provider == first_provider:
+            continue
+        try:
+            res = await extract_plant_unloading_sheet(file_path, preferred_provider=provider)
+        except Exception as e:
+            attempts.append({"provider": provider, "status": "error", "error": str(e)[:200], "role": "second_reader"})
+            continue
+        for a in (res or {}).get("provider_attempts") or []:
+            attempts.append(dict(a, role="second_reader"))
+        if isinstance(res, dict) and res.get("rows"):
+            second = res
+            break
+    readings = [(first.get("source") or first_provider, first)]
+    if second:
+        readings.append((second.get("source") or "second", second))
+    v = verify_unloading(readings)
+    out = dict(first)
+    out["rows"] = v["rows"]
+    for key in ("plant_name", "item_name", "party_name", "rm_number", "po_number", "sheet_date"):
+        if not out.get(key) and second and second.get(key):
+            out[key] = second.get(key)
+    out["provider_attempts"] = attempts
+    out["verification"] = {k: v[k] for k in ("readers", "rows_total", "rows_verified")}
+    out["needs_review"] = v["needs_review"]
+    out["review_reasons"] = v["review_reasons"]
+    out["high_confidence"] = not v["needs_review"]
+    out["confidence"] = round(v["rows_verified"] / v["rows_total"], 3) if v["rows_total"] else 0.0
+    return out
 
 
 async def extract_rejection_notice(file_path: str, preferred_provider: Optional[str] = None) -> dict:
@@ -5268,7 +5379,7 @@ async def extract_document_by_type(file_path: str, document_type: str, prefer_oc
     if doc_type == "purchase_bill":
         res = await extract_bill_verified(file_path, preferred_provider=provider_key)
     elif doc_type == "plant_unloading":
-        res = await extract_plant_unloading_sheet(file_path, preferred_provider=provider_key)
+        res = await extract_plant_unloading_sheet_verified(file_path, preferred_provider=provider_key)
     elif doc_type == "tender_notice":
         res = await extract_tender_notice(file_path, preferred_provider=provider_key)
     elif doc_type == "purchase_order":
