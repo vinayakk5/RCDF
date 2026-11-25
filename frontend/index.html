@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#181c27">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>RCDF Supply — Operations</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
@@ -249,11 +252,127 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 @keyframes spin{to{transform:rotate(360deg)}}
 
 input[type=number]::-webkit-inner-spin-button{opacity:.5;}
+
+/* ── CAMERA + MOBILE HELPERS ─────────────────────────────────────────── */
+.cam-btn{display:inline-flex;align-items:center;gap:6px;}
+.m-only{display:none!important;}
+.menu-btn{display:none;background:none;border:1px solid var(--border2);color:var(--text);border-radius:8px;width:40px;height:40px;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;}
+.sidebar-backdrop{display:none;}
+.bottom-nav{display:none;}
+.today-flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;}
+.flow-tile{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:14px;cursor:pointer;display:flex;flex-direction:column;gap:6px;transition:border-color .15s;position:relative;text-align:left;color:var(--text);font-family:var(--sans);}
+.flow-tile:hover{border-color:var(--accent);}
+.flow-step{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;}
+.flow-name{font-size:16px;font-weight:500;}
+.flow-count{font-family:var(--mono);font-size:20px;color:var(--accent);}
+.flow-count.zero{color:var(--muted2);}
+.flow-hint{font-size:11px;color:var(--muted);line-height:1.35;}
+.snap-btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:16px;border-radius:12px;font-size:16px;font-weight:500;background:var(--accent);border:none;color:#fff;cursor:pointer;font-family:var(--sans);}
+.cam-fab{display:none;position:fixed;right:16px;bottom:calc(76px + env(safe-area-inset-bottom));z-index:210;width:60px;height:60px;border-radius:50%;background:var(--accent);color:#fff;border:none;align-items:center;justify-content:center;box-shadow:0 6px 18px rgba(0,0,0,.45);cursor:pointer;}
+.cam-fab:active{background:var(--accent2);}
+#page-bills.m-detail ~ .cam-fab{display:none;}
+.snap-btn:active{background:var(--accent2);}
+/* Desktop with a mouse: the camera button just opens a file picker, so hide it. */
+@media (hover:hover) and (pointer:fine) and (min-width:900px){ .cam-btn{display:none!important;} }
+
+@media (max-width:800px){
+  html,body{height:100%;}
+  body{height:100dvh;font-size:15px;}
+  .m-only{display:revert!important;}
+  .d-only{display:none!important;}
+  .menu-btn{display:inline-flex;}
+
+  /* Sidebar becomes a slide-out drawer */
+  .sidebar{position:fixed;top:0;left:0;bottom:0;width:78vw;max-width:300px;z-index:300;transform:translateX(-105%);transition:transform .22s ease;box-shadow:4px 0 24px rgba(0,0,0,.5);}
+  body.nav-open .sidebar{transform:none;}
+  body.nav-open .sidebar-backdrop{display:block;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:299;}
+  .nav-item{padding:12px 12px;font-size:15px;}
+  .nav-icon{width:18px;height:18px;}
+
+  .main{width:100%;min-width:0;padding-bottom:calc(62px + env(safe-area-inset-bottom));}
+
+  /* Top bar: title row, then actions in a sideways-scrolling strip */
+  .topbar{padding:8px 12px;padding-top:calc(8px + env(safe-area-inset-top));align-items:center;gap:8px;}
+  .topbar-title{font-size:16px;padding-top:0;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  #topbar-sub{display:none;}
+  .topbar-right{margin-left:0;width:100%;flex-wrap:nowrap;overflow-x:auto;justify-content:flex-start;padding-bottom:2px;-webkit-overflow-scrolling:touch;}
+  .topbar-right:empty{display:none;}
+  .topbar-right > *{flex-shrink:0;}
+  .topbar-right > div{flex-wrap:nowrap!important;}
+  .topbar-right input:not([type=checkbox]):not([type=radio]),.topbar-right select{min-width:140px!important;}
+
+  /* Context bar collapses to one row you tap to open */
+  .contextbar{height:auto;padding:8px 12px;flex-wrap:wrap;gap:8px;}
+  .contextbar:not(.open) > :not(.ctx-toggle){display:none!important;}
+  .contextbar.open .ctx-inline{width:100%;}
+  .contextbar.open .ctx-select{flex:1;min-width:0;}
+  .ctx-toggle{display:flex!important;width:100%;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;font-family:var(--sans);cursor:pointer;text-align:left;}
+  .ctx-toggle .ctx-sum{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+
+  /* Bigger touch targets */
+  .btn{padding:10px 14px;font-size:14px;border-radius:8px;}
+  .btn-sm{padding:8px 12px;font-size:13px;}
+  .btn-xs{padding:6px 10px;font-size:12px;}
+  .form-input,.form-select,.field-input,.field-sel,.ctx-select{font-size:16px;padding:10px 12px;min-height:42px;}
+  .pill{font-size:11px;}
+
+  /* Pages */
+  .page{padding:12px;}
+  .page > div[style*="padding:20px"]{padding:0!important;}
+  .page [style*="grid-template-columns"]{grid-template-columns:1fr!important;}
+  .page .stats-grid,.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:8px;}
+  .page [style*="repeat(4,1fr)"]{grid-template-columns:repeat(2,minmax(0,1fr))!important;}
+  #page-bills [style*="repeat(4,1fr)"]{grid-template-columns:repeat(4,minmax(0,1fr))!important;}
+  .cam-fab.show{display:flex;}
+  .page .today-flow{grid-template-columns:repeat(2,minmax(0,1fr))!important;}
+  .stat-card{padding:12px;}
+  .stat-n{font-size:18px;}
+  .sec-header{flex-wrap:wrap;}
+  .form-row{grid-template-columns:1fr;}
+  .fields-grid{grid-template-columns:1fr;}
+  .field-row{border-right:none!important;}
+  .field-row:nth-last-child(2){border-bottom:1px solid var(--border);}
+
+  /* Tables scroll sideways instead of squashing */
+  .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+  .tbl{min-width:640px;}
+  .tbl th,.tbl td{padding:9px 10px;}
+  .tbl td{font-size:13px;}
+  .page [style*="overflow:auto"],.page [style*="overflow-x:auto"]{-webkit-overflow-scrolling:touch;}
+
+  /* Pop-ups open full screen */
+  .modal-overlay{align-items:stretch;z-index:400;}
+  .modal{width:100%!important;max-width:100%!important;min-width:0!important;height:100%;max-height:100%!important;border-radius:0;border:none;display:flex;flex-direction:column;}
+  .modal-head{position:sticky;top:0;background:var(--bg2);z-index:2;padding-top:calc(16px + env(safe-area-inset-top));}
+  .modal-body{flex:1;}
+  .modal-foot{position:sticky;bottom:0;background:var(--bg2);flex-wrap:wrap;padding-bottom:calc(14px + env(safe-area-inset-bottom));}
+  .modal-foot .btn{flex:1;}
+
+  /* Bill review: list first, tap a bill to open its detail */
+  #page-bills .split-layout,#page-bills.bills-table-mode .split-layout{flex-direction:column;}
+  #page-bills .split-list,#page-bills.bills-table-mode .split-list{width:100%!important;flex:1 1 auto!important;border:none!important;}
+  #page-bills .split-detail,#page-bills.bills-table-mode .split-detail{display:none;min-width:0!important;border:none!important;}
+  #page-bills.m-detail .split-list{display:none;}
+  #page-bills.m-detail .split-detail{display:block;flex:1 1 auto!important;}
+  #page-bills{padding:0;}
+  .bills-table-scroll{height:auto;min-height:0;}
+  .detail-header{flex-wrap:wrap;padding:10px 12px;}
+  .detail-body{padding:12px;}
+
+  .toast{left:12px;right:12px;bottom:calc(72px + env(safe-area-inset-bottom));max-width:none;}
+
+  /* Bottom tab bar with the daily flow */
+  .bottom-nav{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:200;background:var(--bg2);border-top:1px solid var(--border);padding-bottom:env(safe-area-inset-bottom);}
+  .bn-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:8px 2px 7px;font-size:11px;color:var(--muted);background:none;border:none;cursor:pointer;font-family:var(--sans);}
+  .bn-item svg{width:20px;height:20px;}
+  .bn-item.active{color:var(--accent);}
+}
 </style>
 </head>
 <body>
 
 <!-- SIDEBAR -->
+<div class="sidebar-backdrop" onclick="toggleSidebar(false)"></div>
 <div class="sidebar">
   <div class="logo">
     <div class="logo-main">RCDF Supply</div>
@@ -361,6 +480,7 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
 <!-- MAIN -->
 <div class="main">
   <div class="topbar">
+    <button class="menu-btn" aria-label="Menu" onclick="toggleSidebar()"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 5h14M3 10h14M3 15h14"/></svg></button>
     <div class="topbar-title" id="page-title">Home</div>
     <div class="topbar-sep"></div>
     <span id="topbar-sub" style="font-size:11px;color:var(--muted)"></span>
@@ -401,6 +521,16 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
   <div id="page-audit" class="page" style="overflow-y:auto;"></div>
 </div>
 
+
+<!-- BOTTOM NAV (phones only) -->
+<nav class="bottom-nav" id="bottom-nav">
+  <button class="bn-item active" data-page="home" onclick="nav('home')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 7.5L8 2l6 5.5V14a1 1 0 0 1-1 1h-3.5v-4h-3v4H3a1 1 0 0 1-1-1V7.5z"/></svg>Today</button>
+  <button class="bn-item" data-page="bills" onclick="nav('bills')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="12" height="12" rx="2"/><line x1="5" y1="6" x2="11" y2="6"/><line x1="5" y1="9" x2="9" y2="9"/></svg>Bills</button>
+  <button class="bn-item" data-page="plant-details" onclick="nav('plant-details')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="7" width="10" height="7" rx="1"/><path d="M11 9l3-2v6l-3-2"/></svg>Plant</button>
+  <button class="bn-item" data-page="payments" onclick="nav('payments')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="4" width="14" height="9" rx="1.5"/><line x1="1" y1="7" x2="15" y2="7"/></svg>Pay</button>
+  <button class="bn-item" data-page="more" onclick="toggleSidebar(true)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="3" cy="8" r="1.2"/><circle cx="8" cy="8" r="1.2"/><circle cx="13" cy="8" r="1.2"/></svg>More</button>
+</nav>
+<button class="cam-fab" id="cam-fab" aria-label="Take photo" onclick="camFabClick()"><svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 5h2.5l1.2-1.8h4.6L11.5 5H14v8H2z"/><circle cx="8" cy="9" r="2.4"/></svg></button>
 <div class="toast" id="toast-el"></div>
 <div id="modal-container"></div>
 
@@ -414,7 +544,7 @@ let state = {
   context: { companyId: null, mainTenderId: null },
   globalView: false,
   currentPage: 'home',
-  bills: [], selectedBill: null, billFilter: 'all', billView: 'table', billSearch: '', billSort: 'created_desc',
+  bills: [], selectedBill: null, billFilter: 'all', billView: (window.innerWidth <= 800 ? 'cards' : 'table'), billSearch: '', billSort: 'created_desc',
   tenders: [], deals: [],
   purchaseOrders: [],
   purchaseBills: [],
@@ -497,7 +627,15 @@ function renderContextBar() {
       ? '<span class="pill pill-active">Scoped mode</span>'
       : '<span class="pill pill-pending">Select company + main tender</span>';
 
+  const ctxSummary = state.globalView
+    ? 'All companies (global view)'
+    : hasScopedContext()
+      ? `${escapeHtml(selectedCompany()?.name || '-')} / ${escapeHtml(selectedMainTender()?.tender_code || '-')}`
+      : 'Choose company and tender';
   el.innerHTML = `
+    <button class="ctx-toggle m-only" onclick="document.getElementById('context-bar').classList.toggle('open')">
+      <span class="ctx-label">Firm</span><span class="ctx-sum">${ctxSummary}</span><span>▾</span>
+    </button>
     <span class="ctx-label">Context</span>
     <div class="ctx-inline">
       <select class="ctx-select" id="ctx-company" onchange="onContextCompanyChange(this.value)">${companyOpts}</select>
@@ -576,6 +714,65 @@ async function reloadScopedData() {
   pages[state.currentPage]?.load();
 }
 
+
+// ── Phone helpers: drawer menu + camera capture ─────────────────────────────
+function isPhone() { return window.matchMedia('(max-width: 800px)').matches; }
+
+function toggleSidebar(open) {
+  const want = typeof open === 'boolean' ? open : !document.body.classList.contains('nav-open');
+  document.body.classList.toggle('nav-open', want);
+}
+
+// Opens the phone's back camera for an existing upload input. The photo then
+// goes through that input's normal onchange upload, exactly like a picked file.
+function takePhoto(inputId) {
+  const input = document.getElementById(inputId);
+  if (!input) return toast('Upload input not found', 'err');
+  const prevAccept = input.getAttribute('accept');
+  const prevMultiple = input.hasAttribute('multiple');
+  const restore = () => {
+    input.removeAttribute('capture');
+    if (prevAccept !== null) input.setAttribute('accept', prevAccept);
+    if (prevMultiple) input.setAttribute('multiple', '');
+  };
+  input.value = '';
+  input.setAttribute('accept', 'image/*');
+  input.setAttribute('capture', 'environment');
+  input.removeAttribute('multiple');
+  input.addEventListener('change', () => setTimeout(restore, 0), { once: true });
+  window.addEventListener('focus', () => setTimeout(restore, 1500), { once: true });
+  input.click();
+}
+
+function cameraButton(inputId, label = 'Take photo', extraClass = '') {
+  return `<button type="button" class="btn cam-btn ${extraClass}" onclick="takePhoto('${inputId}')">
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 5h2.5l1.2-1.8h4.6L11.5 5H14v8H2z"/><circle cx="8" cy="9" r="2.4"/></svg>${label}</button>`;
+}
+
+// Floating camera button on phones, for pages that take photo uploads.
+const CAM_FAB_ACTIONS = {
+  bills: () => takePhoto('bill-upload-file'),
+  'plant-details': () => pages['plant-details'].openUploadEngineModal('single', true),
+  'busy-staging': () => takePhoto('busy-staging-file'),
+};
+function updateCamFab() {
+  const fab = document.getElementById('cam-fab');
+  if (!fab) return;
+  const billDetailOpen = state.currentPage === 'bills' && document.getElementById('page-bills')?.classList.contains('m-detail');
+  fab.classList.toggle('show', Boolean(CAM_FAB_ACTIONS[state.currentPage]) && !billDetailOpen);
+}
+function camFabClick() {
+  const fn = CAM_FAB_ACTIONS[state.currentPage];
+  if (fn) fn();
+}
+
+async function homeSnapBill(input) {
+  if (!input.files || !input.files[0]) return;
+  if (canAccessWorkspace('bills')) nav('bills');
+  await pages.bills.upload(input);
+  input.value = '';
+}
+
 // ── Navigation ─────────────────────────────────────────────────────────────
 function nav(page, el) {
   if (!canAccessWorkspace(page)) {
@@ -603,6 +800,11 @@ function nav(page, el) {
     audit: 'Audit Logs', receipts: 'Receipts', 'plant-details': 'Plant Unloading Details'
   };
   document.getElementById('page-title').textContent = titles[page] || page;
+  toggleSidebar(false);
+  document.getElementById('context-bar')?.classList.remove('open');
+  document.getElementById('page-bills')?.classList.remove('m-detail');
+  document.querySelectorAll('#bottom-nav .bn-item').forEach(b => b.classList.toggle('active', b.dataset.page === page));
+  updateCamFab();
   window.__topbarActionsKey = '';
   document.getElementById('topbar-actions').innerHTML = '';
   document.getElementById('topbar-sub').textContent = '';
@@ -1094,6 +1296,15 @@ pages.home = {
 
     el.innerHTML = `
       <div style="max-width:960px;margin:0 auto;padding:20px 8px 8px 8px;display:flex;flex-direction:column;gap:14px">
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <label class="snap-btn" style="cursor:pointer">
+            <svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 5h2.5l1.2-1.8h4.6L11.5 5H14v8H2z"/><circle cx="8" cy="9" r="2.4"/></svg>
+            <span class="m-only">Snap a bill</span><span class="d-only">Upload a bill</span>
+            <input id="home-bill-camera" type="file" accept="image/*" capture="environment" style="display:none" onchange="homeSnapBill(this)">
+          </label>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-top:4px">Today's work, in order</div>
+          <div class="today-flow" id="home-today-flow">${pages.home.flowTiles({})}</div>
+        </div>
         <div class="stat-card" style="padding:20px;background:linear-gradient(130deg,#1c2236,#11151f)">
           <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Workspace Context</div>
           <div style="margin-top:8px;font-size:24px;font-family:var(--mono);line-height:1.3">
@@ -1146,6 +1357,47 @@ pages.home = {
           <div id="home-backfill-result" style="padding:0 14px 14px 14px;color:var(--muted);font-size:12px"></div>
         </div>
       </div>`;
+    this.loadFlowCounts();
+  },
+
+  flowTiles(c) {
+    const money = v => (v === undefined || v === null) ? '' : '₹' + Math.round(Number(v) || 0).toLocaleString('en-IN');
+    const num = v => (v === undefined || v === null) ? '' : String(v);
+    const steps = [
+      { n: 1, name: 'Bills in', page: 'pending-ingests', count: num(c.ingests), hint: 'From email, WhatsApp and photos' },
+      { n: 2, name: 'Check', page: 'bills', filter: 'pending', count: num(c.toCheck), hint: 'Bills waiting for review' },
+      { n: 3, name: 'Match', page: 'bills', filter: 'approved', count: num(c.toMatch), hint: 'Approved bills to link to a deal' },
+      { n: 4, name: 'Pay', page: 'payments', count: money(c.toPay), hint: 'Purchase bills not paid yet' },
+      { n: 5, name: 'Sell', page: 'sales-bills', count: money(c.toCollect), hint: 'Sales amount still to collect' },
+      { n: 6, name: 'Busy', page: 'busy-export', count: '', hint: 'Export entries to Busy' },
+    ];
+    return steps.map(st => `
+      <button class="flow-tile" onclick="${st.filter ? `state.billFilter='${st.filter}';` : ''}nav('${st.page}')">
+        <span class="flow-step">Step ${st.n}</span>
+        <span class="flow-name">${st.name}</span>
+        ${st.count !== '' ? `<span class="flow-count ${(st.count === '0' || st.count === '₹0') ? 'zero' : ''}">${st.count}</span>` : ''}
+        <span class="flow-hint">${st.hint}</span>
+      </button>`).join('');
+  },
+
+  async loadFlowCounts() {
+    const c = {};
+    try {
+      const rows = await apiFetch('/ingest/pending?status=pending');
+      c.ingests = Array.isArray(rows) ? rows.length : 0;
+    } catch {}
+    if (state.globalView || hasScopedContext()) {
+      try {
+        const d = await apiFetch('/dashboard');
+        const b = (d && d.bills) || {};
+        c.toCheck = (b.pending || 0) + (b.flagged || 0);
+        c.toMatch = b.approved || 0;
+        c.toPay = d?.payments?.pending_purchase;
+        c.toCollect = d?.payments?.outstanding_sales;
+      } catch {}
+    }
+    const el = document.getElementById('home-today-flow');
+    if (el) el.innerHTML = this.flowTiles(c);
   },
 
   enterWorkspace() {
@@ -2883,13 +3135,14 @@ pages.bills = {
         <button class="btn btn-sm ${state.billView==='table'?'btn-primary':''}" onclick="pages.bills.setView('table')">Table</button>
       </div>
       <div style="display:flex;gap:8px">
+        ${cameraButton('bill-upload-file', 'Photo bill', 'btn-primary')}
         <label class="btn" style="cursor:pointer">
           + Upload bill
-          <input type="file" accept="image/*,.pdf" style="display:none" onchange="pages.bills.upload(this)">
+          <input id="bill-upload-file" type="file" accept="image/*,.pdf" style="display:none" onchange="pages.bills.upload(this)">
         </label>
         <label class="btn" style="cursor:pointer">
           Bulk upload
-          <input type="file" accept="image/*,.pdf" multiple style="display:none" onchange="pages.bills.bulkUpload(this)">
+          <input id="bill-bulk-file" type="file" accept="image/*,.pdf" multiple style="display:none" onchange="pages.bills.bulkUpload(this)">
         </label>
       </div>`, `bills:${state.billFilter}:${state.billSort}:${state.billView}`);
   },
@@ -3179,9 +3432,16 @@ pages.bills = {
     }
   },
 
+  mobileBack() {
+    document.getElementById('page-bills')?.classList.remove('m-detail');
+    updateCamFab();
+  },
+
   renderDetail(b) {
     const panel = document.getElementById('bills-detail-panel');
     if (!b) return;
+    document.getElementById('page-bills')?.classList.add('m-detail');
+    updateCamFab();
     const comp = b.qty_mt && b.rate_per_mt ? b.qty_mt * b.rate_per_mt : null;
     const amtOk = comp && b.total_amount && Math.abs(comp - b.total_amount) / b.total_amount < 0.05;
     const vehOk = b.vehicle_number && /^[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}$/i.test(b.vehicle_number.replace(/\s/g,''));
@@ -3191,6 +3451,7 @@ pages.bills = {
 
     panel.innerHTML = `
       <div class="detail-header">
+        <button class="btn btn-sm m-only" onclick="pages.bills.mobileBack()">‹ Back</button>
         <div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--muted)">Bill #${b.id} · ${b.source}</div>
           <div style="font-size:15px;font-weight:500">${b.broker_name||'Unknown broker'}</div>
@@ -3587,6 +3848,7 @@ pages['plant-details'] = {
         </select>
         <input id="plant-detail-file" type="file" accept="image/*,.pdf" style="display:none" onchange="pages['plant-details'].upload(this)">
         <input id="plant-detail-files" type="file" multiple accept="image/*,.pdf" style="display:none" onchange="pages['plant-details'].bulkUpload(this)">
+        <button class="btn btn-primary cam-btn" onclick="pages['plant-details'].openUploadEngineModal('single', true)"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 5h2.5l1.2-1.8h4.6L11.5 5H14v8H2z"/><circle cx="8" cy="9" r="2.4"/></svg>Photo sheet</button>
         <button class="btn btn-primary" onclick="pages['plant-details'].openUploadEngineModal('single')">Upload plant sheet</button>
         <button class="btn" onclick="pages['plant-details'].openUploadEngineModal('bulk')">Bulk upload</button>
         <button class="btn" onclick="pages['plant-details'].refresh()">Refresh</button>
@@ -3594,7 +3856,8 @@ pages['plant-details'] = {
     await this.refresh();
   },
 
-  openUploadEngineModal(mode) {
+  openUploadEngineModal(mode, useCamera = false) {
+    this.pendingUploadCamera = Boolean(useCamera);
     this.pendingUploadMode = mode === 'bulk' ? 'bulk' : 'single';
     this.pendingUploadInputId = this.pendingUploadMode === 'bulk' ? 'plant-detail-files' : 'plant-detail-file';
 
@@ -3645,7 +3908,9 @@ pages['plant-details'] = {
 
     // Reset value so selecting same file again still triggers onchange.
     input.value = '';
-    input.click();
+    if (this.pendingUploadCamera) takePhoto(inputId);
+    else input.click();
+    this.pendingUploadCamera = false;
     this.pendingUploadInputId = null;
     this.pendingUploadMode = null;
   },
@@ -5941,6 +6206,7 @@ pages['busy-staging'] = {
       </label>
       <input id="busy-staging-file" type="file" accept="image/*,.pdf" multiple style="display:none" onchange="pages['busy-staging'].upload(this)">
       <input id="busy-staging-master-file" type="file" accept=".xlsx,.xls" style="display:none" onchange="pages['busy-staging'].uploadMaster(this)">
+      ${cameraButton('busy-staging-file', 'Photo bill')}
       <button class="btn" onclick="document.getElementById('busy-staging-file').click()">Upload bills</button>
       <button class="btn" onclick="document.getElementById('busy-staging-master-file').click()">Import Busy Party List</button>
       <button class="btn" onclick="pages['busy-staging'].load()">Refresh</button>
