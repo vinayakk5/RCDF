@@ -184,6 +184,9 @@ class Tender(Base):
     supply_start    = Column(Date, nullable=True)
     supply_end      = Column(Date, nullable=True)
     penalty_pct     = Column(Numeric(5, 2), default=20.00)
+    # Our selling rate to the plant (Rs per quintal), from the PO line for this tender.
+    sale_rate_per_qtl = Column(Numeric(10, 2), nullable=True)
+    purchase_order_id = Column(Integer, nullable=True)
     status          = Column(Enum(TenderStatus), default=TenderStatus.pending)
     notes           = Column(Text)
     created_at      = Column(DateTime, default=func.now())
@@ -538,6 +541,7 @@ class PurchaseBill(Base):
     main_tender    = relationship("MainTender")
     tender         = relationship("Tender", foreign_keys=[tender_id])
     broker         = relationship("Broker")
+    bill           = relationship("Bill", foreign_keys=[bill_id])
 
 class SalesBill(Base):
     __tablename__ = "sales_bills"
@@ -556,10 +560,42 @@ class SalesBill(Base):
     busy_exported  = Column(Boolean, default=False)
     busy_export_at = Column(DateTime)
     paid_at        = Column(DateTime)
+    party_name     = Column(String(220), nullable=True)   # Busy party for the plant
+    notes          = Column(Text, nullable=True)
+    created_by     = Column(String(100), nullable=True)
+    cancelled_at   = Column(DateTime, nullable=True)
     created_at     = Column(DateTime, default=func.now())
     company        = relationship("Company")
     main_tender    = relationship("MainTender")
     plant          = relationship("Plant")
+    tender         = relationship("Tender")
+    lines          = relationship("SalesBillLine", back_populates="sales_bill",
+                                  cascade="all, delete-orphan", order_by="SalesBillLine.id")
+
+
+class SalesBillLine(Base):
+    """One plant-unloaded truck (a PlantReceipt) billed on a sales bill.
+
+    receipt_id is unique: an unloaded line can never be billed twice. Lines of a
+    cancelled sales bill are deleted, which frees the receipts for a new bill.
+    Quantities are quintals.
+    """
+    __tablename__ = "sales_bill_lines"
+    id             = Column(Integer, primary_key=True, index=True)
+    sales_bill_id  = Column(Integer, ForeignKey("sales_bills.id"), nullable=False, index=True)
+    receipt_id     = Column(Integer, ForeignKey("plant_receipts.id"), nullable=False, unique=True)
+    tender_id      = Column(Integer, ForeignKey("tenders.id"), nullable=True)
+    material_id    = Column(Integer, ForeignKey("materials.id"), nullable=True)
+    material_name  = Column(String(100))
+    vehicle_number = Column(String(30))
+    receipt_date   = Column(Date)
+    rm_number      = Column(String(100))
+    qty_qtl        = Column(Numeric(12, 3), nullable=False)
+    rate_per_qtl   = Column(Numeric(10, 2), nullable=False)
+    amount         = Column(Numeric(14, 2), nullable=False)
+    created_at     = Column(DateTime, default=func.now())
+    sales_bill     = relationship("SalesBill", back_populates="lines")
+    receipt        = relationship("PlantReceipt")
     tender         = relationship("Tender")
 
 class Payment(Base):
@@ -706,3 +742,68 @@ class WhatsAppLog(Base):
 
     company        = relationship("Company")
 
+
+
+class AutoApprovalDecision(Base):
+    """What auto-approval decided for one incoming document.
+
+    In shadow mode nothing is approved: the decision is only recorded so it can be
+    compared with what the person actually did before auto-approval goes live.
+    """
+    __tablename__ = "auto_approval_decisions"
+    id                = Column(Integer, primary_key=True, index=True)
+    pending_ingest_id = Column(Integer, ForeignKey("pending_ingests.id"), nullable=False, unique=True)
+    company_id        = Column(Integer, nullable=True)
+    document_type     = Column(String(40))
+    mode              = Column(String(10), default="shadow")     # shadow | live
+    would_approve     = Column(Boolean, default=False)
+    checks            = Column(JSON)                             # [{name, ok, detail}]
+    failed_checks     = Column(JSON)                             # names of failed checks
+    predicted_deal_id = Column(Integer, nullable=True)
+    predicted_tender_id = Column(Integer, nullable=True)
+    acted             = Column(Boolean, default=False)           # live mode actually approved it
+    acted_bill_id     = Column(Integer, nullable=True)
+    error             = Column(Text)
+    evaluated_at      = Column(DateTime, default=func.now())
+    created_at        = Column(DateTime, default=func.now())
+
+
+class UserRole(str, enum.Enum):
+    admin      = "admin"        # everything, including users
+    accountant = "accountant"   # bills, payments, sales bills, Busy export
+    operator   = "operator"     # upload and review documents, plant unloading
+    viewer     = "viewer"       # read only
+
+
+class User(Base):
+    __tablename__ = "users"
+    id            = Column(Integer, primary_key=True, index=True)
+    username      = Column(String(80), nullable=False, unique=True)
+    full_name     = Column(String(150))
+    password_hash = Column(String(255), nullable=False)
+    role          = Column(Enum(UserRole), nullable=False, default=UserRole.viewer)
+    company_ids   = Column(JSON, nullable=True)      # null/empty = all firms
+    is_active     = Column(Boolean, default=True)
+    last_login_at = Column(DateTime)
+    created_at    = Column(DateTime, default=func.now())
+    updated_at    = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    token_hash  = Column(String(64), nullable=False, unique=True)
+    expires_at  = Column(DateTime, nullable=False)
+    revoked     = Column(Boolean, default=False)
+    user_agent  = Column(String(255))
+    created_at  = Column(DateTime, default=func.now())
+    last_seen_at = Column(DateTime)
+    user        = relationship("User")
+
+
+class SchemaMigration(Base):
+    __tablename__ = "schema_migrations"
+    version    = Column(String(20), primary_key=True)
+    name       = Column(String(200), nullable=False)
+    applied_at = Column(DateTime, default=func.now())

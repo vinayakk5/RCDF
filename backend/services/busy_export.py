@@ -212,3 +212,46 @@ def export_busy_purchase_bills_xlsx(rows: list, template_path: Path = None) -> b
     out = BytesIO()
     wb.save(out)
     return out.getvalue()
+
+
+BUSY_PAYMENT_XLSX_HEADERS = [
+    "VCH_SERIES",
+    "VCH_DATE",
+    "VCH_NO",
+    "ACCOUNT_DR",      # broker / supplier party (paid to)
+    "ACCOUNT_CR",      # our bank or cash account (paid from)
+    "AMOUNT",
+    "PAYMENT_MODE",
+    "REF_NO",
+    "BILL_REF",        # purchase bill being settled (bill-by-bill adjustment)
+    "NARRATION",
+]
+
+
+def export_busy_sales_bills_xlsx(rows: list, template_path: Path = None) -> bytes:
+    """Sales vouchers use the same Book1 column layout as purchase vouchers."""
+    return export_busy_purchase_bills_xlsx(rows, template_path=template_path)
+
+
+def export_busy_payments_xlsx(rows: list) -> bytes:
+    """Payment vouchers, one row per voucher (Dr party / Cr bank)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Payments"
+    ws.append(BUSY_PAYMENT_XLSX_HEADERS)
+    for r in rows:
+        ws.append([
+            r.get("vch_series", "Main"),
+            r.get("vch_date"),
+            r.get("vch_no"),
+            r.get("account_dr"),
+            r.get("account_cr"),
+            r.get("amount"),
+            r.get("payment_mode"),
+            r.get("ref_no"),
+            r.get("bill_ref"),
+            r.get("narration"),
+        ])
+    out = BytesIO()
+    wb.save(out)
+    return out.getvalue()

@@ -775,6 +775,7 @@ class TenderCreate(BaseModel):
     supply_start:    Optional[date] = None   # this tender's own supply period
     supply_end:      Optional[date] = None   # update when a time-extension order arrives
     penalty_pct:     float = 20.0
+    sale_rate_per_qtl: Optional[float] = None   # our rate to the plant, from the PO
     notes:           Optional[str] = None
 
 class DealCreate(BaseModel):
@@ -1059,6 +1060,7 @@ def _tender_to_dict(t: Tender, db: Session = None) -> dict:
         "supply_end": str(t.supply_end) if t.supply_end else None,
         "status": t.status.value,
         "penalty_pct": float(t.penalty_pct),
+        "sale_rate_per_qtl": float(t.sale_rate_per_qtl) if getattr(t, "sale_rate_per_qtl", None) is not None else None,
         "notes": t.notes,
         "deals": deals_list,
         "summary": {
@@ -5593,6 +5595,8 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
                         company_id=company_id,
                         main_tender_id=main_tender_id,
                         cycle_id=cycle.id,
+                        sale_rate_per_qtl=_to_float(item.get("approved_rate_per_qtl") or item.get("rate_per_qtl")) or None,
+                        purchase_order_id=po.id,
                         tender_number=tender_no,
                         plant_id=plant_id,
                         material_id=mat_id,
@@ -5617,6 +5621,10 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
                     t.supply_end = supply_end
                     t.cycle_id = cycle.id
                     t.status = TenderStatus.active
+                    line_rate = _to_float(item.get("approved_rate_per_qtl") or item.get("rate_per_qtl"))
+                    if line_rate and line_rate > 0:
+                        t.sale_rate_per_qtl = line_rate
+                    t.purchase_order_id = po.id
                 created_tender_ids.append(t.id)
 
             if created_tender_ids:
@@ -9652,21 +9660,116 @@ def list_purchase_bills(status: Optional[str] = None, company_id: Optional[int] 
 
 @app.get("/api/sales-bills")
 def list_sales_bills(status: Optional[str] = None, company_id: Optional[int] = None,
-                     main_tender_id: Optional[int] = None, db: Session = Depends(get_db)):
+                     main_tender_id: Optional[int] = None, include_lines: bool = False,
+                     db: Session = Depends(get_db)):
+    from services.sales_billing import sales_bill_to_dict
     q = select(SalesBill).order_by(desc(SalesBill.created_at))
     q = _apply_scope_filters(q, SalesBill, company_id, main_tender_id)
     if status: q = q.where(SalesBill.status == SalesBillStatus(status))
-    sbs = db.execute(q).scalars().all()
-    return [{
-        "id": sb.id, "sb_number": sb.sb_number,
-        "company_id": sb.company_id,
-        "main_tender_id": sb.main_tender_id,
-        "plant": sb.plant.name, "tender_id": sb.tender_id,
-        "qty_mt": float(sb.qty_mt), "rate_per_mt": float(sb.rate_per_mt),
-        "total_amount": float(sb.total_amount),
-        "bill_date": str(sb.bill_date), "status": sb.status.value,
-        "busy_exported": sb.busy_exported,
-    } for sb in sbs]
+    return [sales_bill_to_dict(sb, with_lines=include_lines) for sb in db.execute(q).scalars().all()]
+
+
+class SalesBillCreate(BaseModel):
+    receipt_ids: List[int]
+    bill_date:   Optional[date] = None
+    due_date:    Optional[date] = None
+    sb_number:   Optional[str] = None
+    notes:       Optional[str] = None
+
+
+def _sales_bill_http_error(e) -> HTTPException:
+    return HTTPException(400, {"message": str(e), "details": getattr(e, "details", [])})
+
+
+@app.get("/api/sales-bills/billable-lines")
+def list_sales_billable_lines(company_id: Optional[int] = None, main_tender_id: Optional[int] = None,
+                              tender_id: Optional[int] = None, plant_id: Optional[int] = None,
+                              include_unbillable: bool = True, db: Session = Depends(get_db)):
+    """Plant-unloaded truck lines (accepted qty) that are not on any sales bill yet."""
+    from services.sales_billing import list_billable_lines
+    return list_billable_lines(db, company_id=company_id, plant_id=plant_id, tender_id=tender_id,
+                               main_tender_id=main_tender_id, include_unbillable=include_unbillable)
+
+
+@app.post("/api/sales-bills")
+def create_sales_bill_endpoint(data: SalesBillCreate, request: Request, company_id: Optional[int] = None,
+                               db: Session = Depends(get_db)):
+    from services.sales_billing import SalesBillError, create_sales_bill, sales_bill_to_dict
+    user = getattr(request.state, "user", None)
+    try:
+        sb = create_sales_bill(
+            db, data.receipt_ids, bill_date=data.bill_date, sb_number=data.sb_number,
+            due_date=data.due_date, notes=data.notes,
+            created_by=getattr(user, "username", None), company_id_scope=company_id,
+        )
+    except SalesBillError as e:
+        db.rollback()
+        raise _sales_bill_http_error(e)
+    except Exception as e:
+        db.rollback()
+        # The unique receipt_id index is the last line of defence against double billing.
+        if "sales_bill_lines" in str(e) or "UNIQUE" in str(e).upper() or "Duplicate" in str(e):
+            raise HTTPException(409, "One of these lines was just billed on another sales bill. Refresh and try again.")
+        raise
+    _audit(db, "sales_bill", sb.id, "create", {"receipt_ids": data.receipt_ids, "by": getattr(user, "username", None)})
+    db.commit()
+    db.refresh(sb)
+    return sales_bill_to_dict(sb)
+
+
+@app.get("/api/sales-bills/{sb_id}")
+def get_sales_bill(sb_id: int, company_id: Optional[int] = None, main_tender_id: Optional[int] = None,
+                   db: Session = Depends(get_db)):
+    from services.sales_billing import sales_bill_to_dict
+    sb = db.get(SalesBill, sb_id)
+    _assert_record_scope(sb, company_id, main_tender_id, label="Sales bill")
+    return sales_bill_to_dict(sb)
+
+
+@app.post("/api/sales-bills/{sb_id}/cancel")
+def cancel_sales_bill_endpoint(sb_id: int, request: Request, company_id: Optional[int] = None,
+                               main_tender_id: Optional[int] = None, db: Session = Depends(get_db)):
+    from services.sales_billing import SalesBillError, cancel_sales_bill, sales_bill_to_dict
+    sb = db.get(SalesBill, sb_id)
+    _assert_record_scope(sb, company_id, main_tender_id, label="Sales bill")
+    was_exported = bool(sb.busy_exported)
+    try:
+        cancel_sales_bill(db, sb)
+    except SalesBillError as e:
+        raise _sales_bill_http_error(e)
+    user = getattr(request.state, "user", None)
+    _audit(db, "sales_bill", sb.id, "cancel", {"by": getattr(user, "username", None), "was_exported": was_exported})
+    db.commit()
+    out = sales_bill_to_dict(sb)
+    if was_exported:
+        out["warning"] = "This bill was already exported to Busy. Cancel or delete it in Busy as well."
+    return out
+
+
+@app.patch("/api/sales-bills/{sb_id}/status")
+def update_sales_bill_status(sb_id: int, status: str, company_id: Optional[int] = None,
+                             main_tender_id: Optional[int] = None, db: Session = Depends(get_db)):
+    from services.sales_billing import sales_bill_to_dict
+    sb = db.get(SalesBill, sb_id)
+    _assert_record_scope(sb, company_id, main_tender_id, label="Sales bill")
+    new_status = SalesBillStatus(status)
+    if new_status == SalesBillStatus.cancelled:
+        raise HTTPException(400, "Use the cancel action to cancel a sales bill")
+    if sb.status == SalesBillStatus.cancelled:
+        raise HTTPException(400, "Sales bill is cancelled")
+    sb.status = new_status
+    if new_status == SalesBillStatus.paid:
+        sb.paid_at = datetime.now()
+    db.commit()
+    return sales_bill_to_dict(sb)
+
+
+def _audit(db: Session, entity: str, entity_id: int, action: str, payload: Optional[dict] = None) -> None:
+    try:
+        db.add(AuditLog(entity=entity, entity_id=int(entity_id or 0), action=action, payload=payload or {}))
+    except Exception as e:  # audit must never block the business action
+        log.warning("audit log failed: %s", e)
+
 
 # ── PAYMENTS ───────────────────────────────────────────────────────────────
 
@@ -9735,6 +9838,159 @@ def create_payment(data: PaymentCreate, company_id: Optional[int] = None,
     _refresh_purchase_bill_for_bill(db, pb.bill_id)
     db.commit(); db.refresh(p)
     return {"id": p.id, "voucher_number": p.voucher_number, **_purchase_bill_payment_state(pb)}
+
+@app.get("/api/payments/due")
+def list_payments_due(company_id: Optional[int] = None, main_tender_id: Optional[int] = None,
+                      tender_id: Optional[int] = None, include_awaiting: bool = False,
+                      db: Session = Depends(get_db)):
+    """Purchase bills with money due: accepted qty x deal rate minus what is paid.
+
+    Bills still waiting for the plant unloading result are not payable; they are
+    listed only with include_awaiting=true so the person can see what is coming.
+    Overpaid bills (plant result reduced after payment) are listed for recovery.
+    """
+    q = select(PurchaseBill).where(PurchaseBill.status != PurchaseBillStatus.cancelled).order_by(PurchaseBill.bill_date)
+    q = _apply_scope_filters(q, PurchaseBill, company_id, main_tender_id, tender_id)
+    out = []
+    for pb in db.execute(q).scalars().all():
+        _refresh_purchase_bill_for_bill(db, pb.bill_id)
+        st = _purchase_bill_payment_state(pb)
+        if st["payment_state"] in ("paid", "nothing_due"):
+            continue
+        if st["payment_state"] == "awaiting_unloading" and not include_awaiting:
+            continue
+        bill = pb.bill
+        out.append({
+            "purchase_bill_id": pb.id, "pb_number": pb.pb_number,
+            "company_id": pb.company_id, "broker": pb.broker.name if pb.broker else None,
+            "broker_id": pb.broker_id,
+            "bill_number": bill.bill_number if bill else None,
+            "vehicle_number": bill.vehicle_number if bill else None,
+            "bill_date": str(pb.bill_date) if pb.bill_date else None,
+            "billed_qty_qtl": float(pb.billed_qty_qtl) if pb.billed_qty_qtl is not None else None,
+            "accepted_qty_qtl": float(pb.qty_mt or 0),
+            "deal_rate_per_qtl": float(pb.rate_per_mt or 0),
+            **st,
+        })
+    db.commit()
+    return out
+
+
+def _busy_party_for_broker(db: Session, company_id: Optional[int], broker: Optional[Broker]) -> str:
+    name = broker.name if broker else "Unknown Broker"
+    if company_id is not None and broker is not None:
+        m = db.execute(select(BusyPartyMapping).where(
+            BusyPartyMapping.company_id == company_id,
+            func.lower(BusyPartyMapping.source_party_name) == name.strip().lower(),
+        )).scalar_one_or_none()
+        if m:
+            return m.busy_party_name
+    return name
+
+
+def _busy_payment_rows(db: Session, pays: List[Payment]) -> List[dict]:
+    rows = []
+    for p in pays:
+        pb = db.get(PurchaseBill, p.purchase_bill_id) if p.purchase_bill_id else None
+        bill = pb.bill if pb else None
+        bank = os.getenv(f"BUSY_PAYMENT_BANK_ACCOUNT_{p.company_id}") or os.getenv("BUSY_PAYMENT_BANK_ACCOUNT", "Bank")
+        rows.append({
+            "vch_series": "Main",
+            "vch_date": p.payment_date or date.today(),
+            "vch_no": p.voucher_number or f"PMT-{p.id}",
+            "account_dr": _busy_party_for_broker(db, p.company_id, p.broker),
+            "account_cr": bank,
+            "amount": float(p.amount or 0),
+            "payment_mode": (p.payment_mode or "neft").upper(),
+            "ref_no": p.reference_no or "",
+            "bill_ref": (bill.bill_number if bill and bill.bill_number else (pb.pb_number if pb else "")),
+            "narration": (
+                f"Paid on plant-accepted {float(pb.qty_mt or 0):g} qtl x Rs {float(pb.rate_per_mt or 0):g}"
+                f" (truck {bill.vehicle_number if bill else ''})" if pb else (p.notes or "")
+            ),
+        })
+    return rows
+
+
+def _export_payments_busy_xlsx(db: Session, pays: List[Payment], company_id: Optional[int], main_tender_id: Optional[int]) -> Response:
+    from services.busy_export import export_busy_payments_xlsx, save_export_bytes
+    if not pays:
+        raise HTTPException(404, "No payments to export")
+    content = export_busy_payments_xlsx(_busy_payment_rows(db, pays))
+    fpath = save_export_bytes(content, "payment_vouchers_busy", get_settings(), ext="xlsx")
+    for p in pays:
+        p.busy_exported = True
+        p.busy_export_at = datetime.now()
+    db.add(BusyExport(export_type="payment_voucher", record_ids=[p.id for p in pays], file_path=fpath,
+                      company_id=company_id, main_tender_id=main_tender_id))
+    db.commit()
+    return Response(content=content,
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": "attachment; filename=busy_payment_vouchers.xlsx"})
+
+
+@app.post("/api/export/payments/busy-xlsx")
+def export_payments_busy_xlsx(data: IdListPayload, company_id: Optional[int] = Query(None),
+                              main_tender_id: Optional[int] = Query(None), db: Session = Depends(get_db)):
+    q = select(Payment).where(Payment.id.in_(list(dict.fromkeys(data.ids or []))),
+                              Payment.status == PaymentStatus.processed)
+    q = _apply_scope_filters(q, Payment, company_id, main_tender_id)
+    return _export_payments_busy_xlsx(db, db.execute(q).scalars().all(), company_id, main_tender_id)
+
+
+@app.get("/api/export/payments/busy-xlsx")
+def export_payments_busy_xlsx_get(company_id: Optional[int] = Query(None), main_tender_id: Optional[int] = Query(None),
+                                  include_exported: bool = Query(False), db: Session = Depends(get_db)):
+    """For the Busy agent: all processed payments not yet sent to Busy."""
+    q = select(Payment).where(Payment.status == PaymentStatus.processed).order_by(Payment.payment_date, Payment.id)
+    if not include_exported:
+        q = q.where(or_(Payment.busy_exported == False, Payment.busy_exported == None))
+    q = _apply_scope_filters(q, Payment, company_id, main_tender_id)
+    return _export_payments_busy_xlsx(db, db.execute(q).scalars().all(), company_id, main_tender_id)
+
+
+def _export_sales_bills_busy_xlsx(db: Session, sbs: List[SalesBill], company_id: Optional[int], main_tender_id: Optional[int]) -> Response:
+    from services.busy_export import export_busy_sales_bills_xlsx, save_export_bytes
+    from services.sales_billing import busy_rows_for_sales_bill
+    sbs = [sb for sb in sbs if sb.status != SalesBillStatus.cancelled and sb.lines]
+    if not sbs:
+        raise HTTPException(404, "No sales bills to export")
+    rows = []
+    for sb in sbs:
+        rows.extend(busy_rows_for_sales_bill(sb))
+    content = export_busy_sales_bills_xlsx(rows)
+    fpath = save_export_bytes(content, "sales_bills_busy", get_settings(), ext="xlsx")
+    for sb in sbs:
+        sb.busy_exported = True
+        sb.busy_export_at = datetime.now()
+        if sb.status == SalesBillStatus.draft:
+            sb.status = SalesBillStatus.sent   # Busy emails the bill to the plant
+    db.add(BusyExport(export_type="sales_bill", record_ids=[sb.id for sb in sbs], file_path=fpath,
+                      company_id=company_id, main_tender_id=main_tender_id))
+    db.commit()
+    return Response(content=content,
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": "attachment; filename=busy_sales_bills.xlsx"})
+
+
+@app.post("/api/export/sales-bills/busy-xlsx")
+def export_sales_bills_busy_xlsx(data: IdListPayload, company_id: Optional[int] = Query(None),
+                                 main_tender_id: Optional[int] = Query(None), db: Session = Depends(get_db)):
+    q = select(SalesBill).where(SalesBill.id.in_(list(dict.fromkeys(data.ids or []))))
+    q = _apply_scope_filters(q, SalesBill, company_id, main_tender_id)
+    return _export_sales_bills_busy_xlsx(db, db.execute(q).scalars().all(), company_id, main_tender_id)
+
+
+@app.get("/api/export/sales-bills/busy-xlsx")
+def export_sales_bills_busy_xlsx_get(company_id: Optional[int] = Query(None), main_tender_id: Optional[int] = Query(None),
+                                     include_exported: bool = Query(False), db: Session = Depends(get_db)):
+    """For the Busy agent: all sales bills not yet sent to Busy."""
+    q = select(SalesBill).where(SalesBill.status != SalesBillStatus.cancelled).order_by(SalesBill.bill_date, SalesBill.id)
+    if not include_exported:
+        q = q.where(or_(SalesBill.busy_exported == False, SalesBill.busy_exported == None))
+    q = _apply_scope_filters(q, SalesBill, company_id, main_tender_id)
+    return _export_sales_bills_busy_xlsx(db, db.execute(q).scalars().all(), company_id, main_tender_id)
+
 
 # ── BUSY EXPORT ────────────────────────────────────────────────────────────
 
