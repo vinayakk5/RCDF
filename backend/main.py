@@ -447,6 +447,13 @@ def _ensure_runtime_schema() -> None:
         _ensure_column(conn, "payments", "main_tender_id", "INT NULL")
         _ensure_column(conn, "payments", "tender_id", "INT NULL")
 
+        # Payables: purchase bill keeps the supplier's billed figures for reference,
+        # while qty_mt/total_amount hold the payable (plant-accepted qty x deal rate).
+        # All quantities in this system are QUINTALS despite the legacy *_mt names.
+        _ensure_column(conn, "purchase_bills", "billed_qty_qtl", "DECIMAL(12,3) NULL")
+        _ensure_column(conn, "purchase_bills", "billed_amount", "DECIMAL(14,2) NULL")
+        _ensure_column(conn, "purchase_bills", "paid_amount", "DECIMAL(14,2) NOT NULL DEFAULT 0")
+
         _ensure_column(conn, "busy_exports", "company_id", "INT NULL")
         _ensure_column(conn, "busy_exports", "main_tender_id", "INT NULL")
         _ensure_column(conn, "busy_exports", "created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP")
@@ -2731,13 +2738,99 @@ def _collect_busy_ready_bill_rows(
     return rows, rejected
 
 
+def _next_doc_number(db: Session, column, prefix: str, width: int = 3) -> str:
+    """Next number in a series like PB-2611-007.
+
+    Uses the highest existing suffix for the prefix (not a row count), so deleting
+    a record can never cause a number to be issued twice.
+    """
+    rows = db.execute(select(column).where(column.like(f"{prefix}%"))).scalars().all()
+    highest = 0
+    for val in rows:
+        tail = str(val or "")[len(prefix):]
+        if tail.isdigit():
+            highest = max(highest, int(tail))
+    return f"{prefix}{highest + 1:0{width}d}"
+
+
+def _accepted_qty_for_bill(db: Session, bill_id: Optional[int]) -> tuple[float, bool]:
+    """Plant-accepted quantity (quintals) for a bill and whether any plant result exists."""
+    if not bill_id:
+        return 0.0, False
+    total = 0.0
+    has_result = False
+    for d in _active_dispatches_for_bill(db, bill_id):
+        for r in _active_receipts_for_dispatch(db, d.id):
+            has_result = True
+            total += float(r.accepted_mt or 0)
+    return round(total, 3), has_result
+
+
+def _refresh_purchase_bill_for_bill(db: Session, bill_id: Optional[int]) -> Optional[PurchaseBill]:
+    """Recompute the payable on a purchase bill: accepted qty x deal rate.
+
+    Payment is due only on what the plant accepted. Until a plant result exists the
+    purchase bill stays in draft with a zero payable.
+    """
+    if not bill_id:
+        return None
+    pb = db.execute(select(PurchaseBill).where(PurchaseBill.bill_id == bill_id)).scalar_one_or_none()
+    if not pb or pb.status == PurchaseBillStatus.cancelled:
+        return pb
+    deal = db.get(Deal, pb.deal_id) if pb.deal_id else None
+    rate = float(deal.rate_per_mt) if deal and deal.rate_per_mt is not None else float(pb.rate_per_mt or 0)
+    accepted, has_result = _accepted_qty_for_bill(db, bill_id)
+    payable = round(accepted * rate, 2)
+    pb.qty_mt = accepted
+    pb.rate_per_mt = rate
+    pb.total_amount = payable
+    paid = float(pb.paid_amount or 0)
+    if not has_result:
+        pb.status = PurchaseBillStatus.draft
+    elif payable > 0 and abs(paid - payable) <= 0.5:
+        pb.status = PurchaseBillStatus.paid
+    else:
+        pb.status = PurchaseBillStatus.confirmed
+    return pb
+
+
+def _purchase_bill_payment_state(pb: PurchaseBill) -> dict:
+    payable = float(pb.total_amount or 0)
+    paid = float(pb.paid_amount or 0)
+    outstanding = round(max(payable - paid, 0), 2)
+    if pb.status == PurchaseBillStatus.draft:
+        state = "awaiting_unloading"
+    elif payable <= 0 and paid <= 0.5:
+        # Fully rejected at plant: nothing to pay.
+        state = "nothing_due"
+    elif paid > payable + 0.5:
+        # Plant result was reduced after payment (e.g. late rejection): recover from broker.
+        state = "overpaid"
+    elif paid <= 0:
+        state = "unpaid"
+    elif outstanding > 0.5:
+        state = "partly_paid"
+    else:
+        state = "paid"
+    return {"payable": payable, "paid_amount": paid, "outstanding": outstanding, "payment_state": state}
+
+
 def _refresh_dispatch_status(db: Session, dispatch_id: Optional[int]) -> None:
     if not dispatch_id:
         return
     d = db.get(Dispatch, dispatch_id)
     if not d:
         return
-    r = _active_receipt_for_dispatch(db, dispatch_id)
+    try:
+        _refresh_dispatch_status_inner(db, d)
+    finally:
+        if d.bill_id:
+            db.flush()
+            _refresh_purchase_bill_for_bill(db, d.bill_id)
+
+
+def _refresh_dispatch_status_inner(db: Session, d: Dispatch) -> None:
+    r = _active_receipt_for_dispatch(db, d.id)
     if not r:
         d.status = DispatchStatus.in_transit
         return
@@ -4860,15 +4953,6 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
                 "reason": "rejection_notice action requires a resolvable plant",
             }
 
-        accepted = 0.0
-        rejected = _to_float(payload.get("rejected_qty_qtl"))
-        if rejected is None:
-            rejected = _to_float(payload.get("quantity_qtl"))
-        if rejected is None:
-            rejected = _to_float(payload.get("weight"))
-        if rejected is None:
-            rejected = 1000.0
-
         mat_id, mat_name = _resolve_material(db, material_name=payload.get("material_type") or payload.get("item_name"))
 
         rejection_date = _parse_optional_date(payload.get("rejection_date") or payload.get("notice_date") or payload.get("bill_date"))
@@ -4877,6 +4961,94 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
         if rejection_type in {"partial", "complete"}:
             reason = f"{reason} ({rejection_type})"
 
+        # Quantities are quintals. Never invent a rejected quantity: a wrong number
+        # here directly changes what gets paid, so unclear notices go to review.
+        explicit_rejected = _to_float(payload.get("rejected_qty_qtl"))
+        truck_qty = _to_float(payload.get("quantity_qtl"))
+        if truck_qty is None:
+            truck_qty = _to_float(payload.get("weight"))
+
+        truck_key = _norm_vehicle(vehicle)
+        ref_date = rejection_date or date.today()
+
+        # Partial rejection usually follows an unloading register row for the same
+        # truck: update that receipt instead of creating a second one.
+        existing_receipt = None
+        rq = select(PlantReceipt).where(
+            PlantReceipt.is_deleted == False,
+            PlantReceipt.plant_id == plant_id,
+        )
+        if company_id is not None:
+            rq = rq.where(or_(PlantReceipt.company_id == company_id, PlantReceipt.company_id == None))
+        near = []
+        for r0 in db.execute(rq).scalars().all():
+            if _norm_vehicle(r0.vehicle_number) != truck_key:
+                continue
+            if mat_id and r0.material_id and r0.material_id != mat_id:
+                continue
+            if r0.receipt_date and abs((r0.receipt_date - ref_date).days) > 10:
+                continue
+            near.append(r0)
+        if len(near) > 1:
+            return {
+                "document_type": doc_type,
+                "manual_required": True,
+                "reason": f"Truck {vehicle} has {len(near)} plant receipts within 10 days; choose the right one manually.",
+            }
+        if near:
+            existing_receipt = near[0]
+
+        if rejection_type == "complete":
+            rejected = explicit_rejected
+            if rejected is None:
+                rejected = truck_qty
+            if rejected is None and existing_receipt is not None:
+                rejected = float(existing_receipt.accepted_mt or 0) + float(existing_receipt.rejected_mt or 0)
+            accepted = 0.0
+        else:
+            rejected = explicit_rejected
+            accepted = None
+            if rejected is not None and truck_qty is not None and truck_qty >= rejected:
+                accepted = round(truck_qty - rejected, 3)
+
+        if rejected is None or rejected <= 0:
+            return {
+                "document_type": doc_type,
+                "manual_required": True,
+                "reason": "Rejected quantity not found in the notice. Enter it manually.",
+            }
+
+        if existing_receipt is not None:
+            r = existing_receipt
+            old_acc = float(r.accepted_mt or 0)
+            old_rej = float(r.rejected_mt or 0)
+            if rejection_type == "complete":
+                new_acc, new_rej = 0.0, float(rejected)
+            else:
+                new_rej = float(rejected)
+                # The plant unloading register is the authority for accepted qty.
+                new_acc = old_acc
+            if r.dispatch_id:
+                try:
+                    _apply_receipt_delta(db, r.dispatch_id, new_acc - old_acc, new_rej - old_rej)
+                except HTTPException as exc:
+                    return {
+                        "document_type": doc_type,
+                        "manual_required": True,
+                        "reason": f"Rejection does not fit receipt #{r.id}: {exc.detail}",
+                    }
+                r.matched_qty_qtl = new_acc + new_rej
+            r.accepted_mt = new_acc
+            r.rejected_mt = new_rej
+            r.received_qty_qtl = new_acc + new_rej
+            r.rejection_reason = reason
+            db.flush()
+            _refresh_dispatch_status(db, r.dispatch_id)
+            return {"updated_receipt_id": r.id, "document_type": doc_type}
+
+        if accepted is None:
+            accepted = 0.0
+
         receipt = PlantReceipt(
             company_id=company_id,
             main_tender_id=main_tender_id,
@@ -4884,7 +5056,7 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
             dispatch_id=None,
             vehicle_number=str(vehicle).strip()[:20],
             plant_id=plant_id,
-            receipt_date=rejection_date or date.today(),
+            receipt_date=ref_date,
             accepted_mt=accepted,
             rejected_mt=rejected,
             received_qty_qtl=accepted + rejected,
@@ -4901,7 +5073,21 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
         )
         db.add(receipt)
         db.flush()
-        return {"created_receipt_id": receipt.id, "document_type": doc_type}
+        _match_receipt_to_dispatch(db, receipt, manual=False)
+        if receipt.dispatch_id:
+            try:
+                _apply_receipt_delta(db, receipt.dispatch_id, accepted, rejected)
+                receipt.matched_dispatch_id = receipt.dispatch_id
+                receipt.matched_qty_qtl = accepted + rejected
+                receipt.match_applied_at = datetime.now()
+            except HTTPException as exc:
+                receipt.dispatch_id = None
+                receipt.matched_dispatch_id = None
+                receipt.match_status = "unmatched"
+                receipt.match_reason = f"Auto-match not applied: {exc.detail}"
+        db.flush()
+        _refresh_dispatch_status(db, receipt.dispatch_id)
+        return {"created_receipt_id": receipt.id, "document_type": doc_type, "match_status": receipt.match_status}
 
     if doc_type == "tender_notice":
         tender_ref = payload.get("tender_rm_number") or payload.get("tender_number") or payload.get("rm_number")
@@ -6185,8 +6371,7 @@ def list_deals(tender_id: Optional[int] = None, broker_id: Optional[int] = None,
 def create_deal(data: DealCreate, company_id: Optional[int] = Query(None),
                 main_tender_id: Optional[int] = Query(None), db: Session = Depends(get_db)):
     # Auto-generate deal number
-    count = db.execute(select(func.count(Deal.id))).scalar() or 0
-    deal_no = f"D-{datetime.now().strftime('%y%m')}-{count+1:03d}"
+    deal_no = _next_doc_number(db, Deal.deal_number, f"D-{datetime.now().strftime('%y%m')}-")
     payload = data.model_dump()
     cid = payload.get("company_id") if payload.get("company_id") is not None else company_id
     mid = payload.get("main_tender_id") if payload.get("main_tender_id") is not None else main_tender_id
@@ -6324,7 +6509,7 @@ def approve_bill(bill_id: int, company_id: Optional[int] = None,
             # Do not attempt to insert a PurchaseBill with NULL broker_id — return friendly error
             raise HTTPException(400, "Cannot create purchase bill: broker unknown for this bill. Link a broker or ensure the deal has a broker.")
 
-        count = db.execute(select(func.count(PurchaseBill.id))).scalar() or 0
+        deal_rate = float(deal.rate_per_mt) if deal and deal.rate_per_mt is not None else float(b.rate_per_mt or 0)
         pb = PurchaseBill(
             company_id   = b.company_id,
             main_tender_id = b.main_tender_id,
@@ -6332,13 +6517,20 @@ def approve_bill(bill_id: int, company_id: Optional[int] = None,
             bill_id      = b.id,
             deal_id      = b.deal_id,
             broker_id    = broker_id,
-            pb_number    = f"PB-{datetime.now().strftime('%y%m')}-{count+1:03d}",
-            qty_mt       = b.qty_mt,
-            rate_per_mt  = b.rate_per_mt,
-            total_amount = b.total_amount,
+            pb_number    = _next_doc_number(db, PurchaseBill.pb_number, f"PB-{datetime.now().strftime('%y%m')}-"),
+            # Payable starts at zero; it is set from plant-accepted qty x deal rate
+            # once the unloading/receipt result arrives (_refresh_purchase_bill_for_bill).
+            qty_mt       = 0,
+            rate_per_mt  = deal_rate,
+            total_amount = 0,
+            billed_qty_qtl = b.qty_mt,
+            billed_amount  = b.total_amount,
+            paid_amount    = 0,
+            status       = PurchaseBillStatus.draft,
             bill_date    = b.bill_date or date.today(),
         )
         db.add(pb)
+        db.flush()
     # Auto-create a dispatch for this bill if it's linked to a deal and no dispatch exists
     # If plant_id is missing but plant_name is present, try to resolve it now
     if not b.plant_id and b.plant_name:
@@ -6379,6 +6571,8 @@ def approve_bill(bill_id: int, company_id: Optional[int] = None,
         _auto_match_open_receipt_for_dispatch(db, d)
         _refresh_dispatch_status(db, d.id)
         _recalculate_deal_dispatched_mt(db, [b.deal_id])
+    db.flush()
+    _refresh_purchase_bill_for_bill(db, b.id)
     db.commit()
     return _bill_to_dict(b)
 
@@ -7593,7 +7787,10 @@ def run_pending_ingest_action(
         p.review_notes = review_notes
 
     try:
-        action_payload = _apply_pending_action(db, p)
+        # Savepoint: if the action fails half-way, undo its partial writes instead of
+        # committing a half-created bill/receipt together with the failure status.
+        with db.begin_nested():
+            action_payload = _apply_pending_action(db, p)
         p.action_payload = action_payload
         if isinstance(action_payload, dict) and action_payload.get("manual_required"):
             p.action_status = "manual"
@@ -9099,8 +9296,11 @@ def list_purchase_bills(status: Optional[str] = None, company_id: Optional[int] 
         "broker": pb.broker.name, "broker_id": pb.broker_id,
         "qty_mt": float(pb.qty_mt), "rate_per_mt": float(pb.rate_per_mt),
         "total_amount": float(pb.total_amount),
+        "billed_qty_qtl": float(pb.billed_qty_qtl) if pb.billed_qty_qtl is not None else None,
+        "billed_amount": float(pb.billed_amount) if pb.billed_amount is not None else None,
         "bill_date": str(pb.bill_date), "status": pb.status.value,
         "busy_exported": pb.busy_exported,
+        **_purchase_bill_payment_state(pb),
     } for pb in pbs]
 
 @app.get("/api/sales-bills")
@@ -9149,24 +9349,45 @@ def create_payment(data: PaymentCreate, company_id: Optional[int] = None,
     pb = db.get(PurchaseBill, data.purchase_bill_id)
     if not pb: raise HTTPException(404, "Purchase bill not found")
     _assert_record_scope(pb, company_id, main_tender_id, tender_id, label="Purchase bill")
-    count = db.execute(select(func.count(Payment.id))).scalar() or 0
+    if pb.status == PurchaseBillStatus.cancelled:
+        raise HTTPException(400, "Purchase bill is cancelled")
+
+    # Payment is due only on plant-accepted qty x deal rate. Recompute first so the
+    # payable reflects the latest unloading/receipt data.
+    _refresh_purchase_bill_for_bill(db, pb.bill_id)
+    db.flush()
+    state = _purchase_bill_payment_state(pb)
+    if state["payment_state"] == "awaiting_unloading":
+        raise HTTPException(400, "No plant unloading result yet for this bill. Payment is allowed only on accepted quantity.")
+    amount = round(float(data.amount or 0), 2)
+    if amount <= 0:
+        raise HTTPException(400, "Payment amount must be greater than zero")
+    if amount > state["outstanding"] + 0.5:
+        raise HTTPException(
+            400,
+            f"Payment ₹{amount:,.2f} exceeds outstanding ₹{state['outstanding']:,.2f} "
+            f"(accepted {float(pb.qty_mt or 0):g} qtl × deal rate ₹{float(pb.rate_per_mt or 0):g}, already paid ₹{state['paid_amount']:,.2f})",
+        )
+
     p = Payment(
         company_id       = pb.company_id,
         main_tender_id   = pb.main_tender_id,
         tender_id        = pb.tender_id,
         purchase_bill_id = data.purchase_bill_id,
         broker_id        = pb.broker_id,
-        voucher_number   = f"PMT-{datetime.now().strftime('%y%m')}-{count+1:03d}",
-        amount           = data.amount,
+        voucher_number   = _next_doc_number(db, Payment.voucher_number, f"PMT-{datetime.now().strftime('%y%m')}-"),
+        amount           = amount,
         payment_date     = data.payment_date or date.today(),
         payment_mode     = data.payment_mode,
         reference_no     = data.reference_no,
         notes            = data.notes,
+        status           = PaymentStatus.processed,
     )
     db.add(p)
-    pb.status = PurchaseBillStatus.paid
+    pb.paid_amount = round(float(pb.paid_amount or 0) + amount, 2)
+    _refresh_purchase_bill_for_bill(db, pb.bill_id)
     db.commit(); db.refresh(p)
-    return {"id": p.id, "voucher_number": p.voucher_number}
+    return {"id": p.id, "voucher_number": p.voucher_number, **_purchase_bill_payment_state(pb)}
 
 # ── BUSY EXPORT ────────────────────────────────────────────────────────────
 
@@ -10204,10 +10425,14 @@ def delete_payment(payment_id: int, company_id: Optional[int] = None,
                    db: Session = Depends(get_db)):
     p = db.get(Payment, payment_id)
     _assert_record_scope(p, company_id, main_tender_id, tender_id, label="Payment")
-    # Revert purchase bill status
+    # Reverse this payment on the purchase bill balance
     pb = db.get(PurchaseBill, p.purchase_bill_id)
-    if pb: pb.status = PurchaseBillStatus.confirmed
+    if pb:
+        pb.paid_amount = round(max(float(pb.paid_amount or 0) - float(p.amount or 0), 0), 2)
     db.delete(p)
+    db.flush()
+    if pb:
+        _refresh_purchase_bill_for_bill(db, pb.bill_id)
     db.commit()
     return {"ok": True}
 

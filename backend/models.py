@@ -511,9 +511,15 @@ class PurchaseBill(Base):
     deal_id        = Column(Integer, ForeignKey("deals.id"), nullable=False)
     broker_id      = Column(Integer, ForeignKey("brokers.id"), nullable=False)
     pb_number      = Column(String(50), unique=True)
+    # Payable figures: qty_mt = plant-accepted qty (QUINTALS, legacy name),
+    # rate_per_mt = deal rate per quintal, total_amount = qty x rate.
     qty_mt         = Column(Numeric(10, 2), nullable=False)
     rate_per_mt    = Column(Numeric(10, 2), nullable=False)
     total_amount   = Column(Numeric(14, 2), nullable=False)
+    # Supplier's invoice figures, kept for reference/reconciliation.
+    billed_qty_qtl = Column(Numeric(12, 3), nullable=True)
+    billed_amount  = Column(Numeric(14, 2), nullable=True)
+    paid_amount    = Column(Numeric(14, 2), nullable=False, default=0)
     bill_date      = Column(Date, nullable=False)
     due_date       = Column(Date)
     status         = Column(Enum(PurchaseBillStatus), default=PurchaseBillStatus.draft)

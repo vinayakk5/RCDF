@@ -713,7 +713,7 @@ function statusPill(s) {
     flagged: 'pill-danger', danger: 'pill-danger', at_risk: 'pill-pending',
     penalty_risk: 'pill-danger', done: 'pill-info', complete: 'pill-info',
     approved: 'pill-active', linked: 'pill-info', draft: 'pill-muted',
-    confirmed: 'pill-active', paid: 'pill-info', sent: 'pill-active', partial: 'pill-pending',
+    confirmed: 'pill-active', paid: 'pill-info', unpaid: 'pill-pending', partly_paid: 'pill-pending', awaiting_unloading: 'pill-muted', overpaid: 'pill-danger', nothing_due: 'pill-muted', sent: 'pill-active', partial: 'pill-pending',
     in_transit: 'pill-pending',
     auto: 'pill-active', manual: 'pill-info', ambiguous: 'pill-pending', unmatched: 'pill-danger',
   };
@@ -721,6 +721,8 @@ function statusPill(s) {
 }
 function fmtAmt(v) { return v ? '₹' + parseFloat(v).toLocaleString('en-IN', { maximumFractionDigits: 0 }) : '—'; }
 function fmtMT(v) { return v ? parseFloat(v).toFixed(1) + ' Qtl' : '—'; }
+// All quantities in RCDF are stored in quintals (legacy field names end in _mt).
+function qtlHint(input) { const h = input && input.parentElement ? input.parentElement.querySelector('.qtl-mt-hint') : null; if (!h) return; const v = parseFloat(input.value); h.textContent = isFinite(v) && v > 0 ? '= ' + (v/10).toLocaleString('en-IN') + ' MT' : ''; }
 
 function normQueryText(v) {
   return String(v || '').toLowerCase().trim();
@@ -1162,17 +1164,17 @@ pages.dashboard = {
           <div class="stats-grid" style="grid-template-columns:repeat(5,minmax(0,1fr))">
             <div class="stat-card">
               <div class="stat-n" style="color:var(--accent)">${t.tender_mt}</div>
-              <div class="stat-l">Tender MT</div>
+              <div class="stat-l">Tender Qtl</div>
               <div class="stat-sub">${t.total} tenders</div>
             </div>
             <div class="stat-card">
               <div class="stat-n">${t.dispatched_mt}</div>
-              <div class="stat-l">Dispatched MT</div>
+              <div class="stat-l">Dispatched Qtl</div>
               <div class="stat-sub">${Math.round(t.dispatched_mt/t.tender_mt*100)||0}% of total</div>
             </div>
             <div class="stat-card">
               <div class="stat-n" style="color:${barColor(t.accepted_pct)}">${t.accepted_mt}</div>
-              <div class="stat-l">Accepted MT</div>
+              <div class="stat-l">Accepted Qtl</div>
               <div class="stat-sub">${t.accepted_pct}% fulfilled</div>
             </div>
             <div class="stat-card">
@@ -2401,8 +2403,8 @@ pages.tenders = {
             <div class="form-field"><div class="form-label">Material</div><select class="form-select" id="tf-mat">${mats}</select></div>
           </div>
           <div class="form-row">
-            <div class="form-field"><div class="form-label">Tender qty (MT)</div><input class="form-input" id="tf-mt" type="number" placeholder="1000"></div>
-            <div class="form-field"><div class="form-label">Week 1 target (MT)</div><input class="form-input" id="tf-w1" type="number" placeholder="50"></div>
+            <div class="form-field"><div class="form-label">Tender qty (Qtl) <span class="qtl-mt-hint" style="color:var(--muted);font-weight:400"></span></div><input class="form-input" id="tf-mt" type="number" placeholder="1000" oninput="qtlHint(this)"></div>
+            <div class="form-field"><div class="form-label">Week 1 target (Qtl)</div><input class="form-input" id="tf-w1" type="number" placeholder="50"></div>
           </div>
           <div class="form-row">
             <div class="form-field"><div class="form-label">Week 1 deadline</div><input class="form-input" id="tf-d1" type="date"></div>
@@ -2528,8 +2530,8 @@ pages.tenders = {
             <div class="form-field"><div class="form-label">Material</div><select class="form-select" id="tf-mat">${mats}</select></div>
           </div>
           <div class="form-row">
-            <div class="form-field"><div class="form-label">Tender qty (MT)</div><input class="form-input" id="tf-mt" type="number" value="${t.tender_mt}"></div>
-            <div class="form-field"><div class="form-label">Week 1 target (MT)</div><input class="form-input" id="tf-w1" type="number" value="${t.week1_target_mt}"></div>
+            <div class="form-field"><div class="form-label">Tender qty (Qtl) <span class="qtl-mt-hint" style="color:var(--muted);font-weight:400">= ${(Number(t.tender_mt||0)/10).toLocaleString('en-IN')} MT</span></div><input class="form-input" id="tf-mt" type="number" value="${t.tender_mt}" oninput="qtlHint(this)"></div>
+            <div class="form-field"><div class="form-label">Week 1 target (Qtl)</div><input class="form-input" id="tf-w1" type="number" value="${t.week1_target_mt}"></div>
           </div>
           <div class="form-row">
             <div class="form-field"><div class="form-label">Week 1 deadline</div><input class="form-input" id="tf-d1" type="date" value="${t.week1_deadline}"></div>
@@ -2646,7 +2648,7 @@ pages.deals = {
                 <td>
                   <div class="prog-wrap" style="min-width:120px">
                     <div class="prog-bar"><div class="prog-fill" style="width:${Math.min(pct,100)}%;background:${barColor(pct)}"></div></div>
-                    <div class="prog-label"><span>${d.accepted_mt}/${d.deal_mt} MT</span><span class="hi">${pct}%</span></div>
+                    <div class="prog-label"><span>${d.accepted_mt}/${d.deal_mt} Qtl</span><span class="hi">${pct}%</span></div>
                   </div>
                 </td>
                 <td>${statusPill(d.status)}</td>
@@ -2711,8 +2713,8 @@ pages.deals = {
             <div class="form-field"><div class="form-label">Material</div><select class="form-select" id="df-mat">${matOpts}</select></div>
           </div>
           <div class="form-row">
-            <div class="form-field"><div class="form-label">Deal qty (MT)</div><input class="form-input" id="df-mt" type="number"></div>
-            <div class="form-field"><div class="form-label">Rate (₹/MT)</div><input class="form-input" id="df-rate" type="number"></div>
+            <div class="form-field"><div class="form-label">Deal qty (Qtl) <span class="qtl-mt-hint" style="color:var(--muted);font-weight:400"></span></div><input class="form-input" id="df-mt" type="number" oninput="qtlHint(this)"></div>
+            <div class="form-field"><div class="form-label">Rate (₹/Qtl)</div><input class="form-input" id="df-rate" type="number"></div>
           </div>
         </div>
         <div class="modal-foot">
@@ -2758,8 +2760,8 @@ pages.deals = {
             <div class="form-field"><div class="form-label">Material</div><select class="form-select" id="de-mat">${matOpts}</select></div>
           </div>
           <div class="form-row">
-            <div class="form-field"><div class="form-label">Deal qty (MT)</div><input class="form-input" id="de-mt" type="number" value="${d.deal_mt}"></div>
-            <div class="form-field"><div class="form-label">Rate (₹/MT)</div><input class="form-input" id="de-rate" type="number" value="${d.rate_per_mt}"></div>
+            <div class="form-field"><div class="form-label">Deal qty (Qtl) <span class="qtl-mt-hint" style="color:var(--muted);font-weight:400">= ${(Number(d.deal_mt||0)/10).toLocaleString('en-IN')} MT</span></div><input class="form-input" id="de-mt" type="number" value="${d.deal_mt}" oninput="qtlHint(this)"></div>
+            <div class="form-field"><div class="form-label">Rate (₹/Qtl)</div><input class="form-input" id="de-rate" type="number" value="${d.rate_per_mt}"></div>
           </div>
           <div class="form-field">
             <div class="form-label">Status</div>
@@ -3246,7 +3248,7 @@ pages.bills = {
                 <div class="deal-radio"><div class="deal-radio-dot"></div></div>
                 <div style="flex:1">
                   <div style="font-size:12px;font-weight:500">${dealSubtenderName(d)}</div>
-                  <div style="font-family:var(--mono);font-size:10px;color:var(--muted)">${d.broker} · ${d.material} · ${d.deal_mt - d.accepted_mt} MT remaining</div>
+                  <div style="font-family:var(--mono);font-size:10px;color:var(--muted)">${d.broker} · ${d.material} · ${d.deal_mt - d.accepted_mt} Qtl remaining</div>
                 </div>
                 <div style="text-align:right">
                   <div class="deal-fill-bar"><div class="deal-fill-inner" style="width:${pct}%"></div></div>
@@ -3263,8 +3265,8 @@ pages.bills = {
     return `<div class="bill-mock ${b.is_handwritten?'hw':''}">
       <div class="bm-head">${b.broker_name||'?'}</div>
       <div class="bm-row"><span>Material:</span><span>${b.material||'?'}</span></div>
-      <div class="bm-row"><span>Qty:</span><span>${b.qty_mt||'?'} MT</span></div>
-      <div class="bm-row"><span>Rate:</span><span>₹${b.rate_per_mt||'?'}/MT</span></div>
+      <div class="bm-row"><span>Qty:</span><span>${b.qty_mt||'?'} Qtl</span></div>
+      <div class="bm-row"><span>Rate:</span><span>₹${b.rate_per_mt||'?'}/Qtl</span></div>
       <div class="bm-row"><span>Vehicle:</span><span>${b.vehicle_number||'?'}</span></div>
       <div class="bm-row"><span>Date:</span><span>${b.bill_date||'?'}</span></div>
       <div class="bm-total"><span>Total</span><span>${fmtAmt(b.total_amount)}</span></div>
@@ -3647,12 +3649,12 @@ pages['plant-details'] = {
           <div class="stat-card"><div class="stat-n">${state.plantDetailsMasters.length}</div><div class="stat-l">Main registers</div></div>
           <div class="stat-card"><div class="stat-n">${state.plantDetailsRows.length}</div><div class="stat-l">Truck rows</div></div>
           <div class="stat-card"><div class="stat-n" style="color:var(--warn)">${pending}</div><div class="stat-l">Pending review</div></div>
-          <div class="stat-card"><div class="stat-n" style="color:var(--success)">${approved}</div><div class="stat-l">Approved / receipts</div><div class="stat-sub">Net ${totalNet.toFixed(3)} MT</div></div>
+          <div class="stat-card"><div class="stat-n" style="color:var(--success)">${approved}</div><div class="stat-l">Approved / receipts</div><div class="stat-sub">Net ${totalNet.toFixed(3)} Qtl</div></div>
         </div>
 
         <div class="tbl-wrap">
           <table class="tbl">
-            <thead><tr><th>RM No.</th><th>Item</th><th>Party</th><th>Plant</th><th>Assign</th><th class="r">Trucks</th><th class="r">Net MT</th><th class="r">Pending</th><th></th></tr></thead>
+            <thead><tr><th>RM No.</th><th>Item</th><th>Party</th><th>Plant</th><th>Assign</th><th class="r">Trucks</th><th class="r">Net Qtl</th><th class="r">Pending</th><th></th></tr></thead>
             <tbody>
               ${!state.plantDetailsMasters.length
                 ? '<tr><td class="tbl-empty" colspan="9">No plant register uploaded yet.</td></tr>'
@@ -3691,7 +3693,7 @@ pages['plant-details'] = {
 
         <div id="plant-rows-wrap" class="tbl-wrap" tabindex="0" onkeydown="pages['plant-details'].onSelectionKeydown(event)">
           <table class="tbl">
-            <thead><tr><th><input id="plant-select-all" type="checkbox" ${allVisibleSelected ? 'checked' : ''} onchange="pages['plant-details'].toggleSelectAllRows(this.checked)"></th><th>Date</th><th>Truck</th><th>WS</th><th>RM</th><th>Item</th><th>Party</th><th class="r">Bags</th><th class="r">Net MT</th><th>Assign</th><th>Status</th><th>Receipt</th><th></th></tr></thead>
+            <thead><tr><th><input id="plant-select-all" type="checkbox" ${allVisibleSelected ? 'checked' : ''} onchange="pages['plant-details'].toggleSelectAllRows(this.checked)"></th><th>Date</th><th>Truck</th><th>WS</th><th>RM</th><th>Item</th><th>Party</th><th class="r">Bags</th><th class="r">Net Qtl</th><th>Assign</th><th>Status</th><th>Receipt</th><th></th></tr></thead>
             <tbody>
               ${this.masterFilter ? (visibleRows.length ? visibleRows.map(r => `<tr data-plant-row-id="${r.id}" onmouseenter="pages['plant-details'].onSelectionRowEnter(event, ${r.id})">
                 <td><input type="checkbox" class="plant-row-chk" value="${r.id}" ${this.selectedRowIds.has(r.id) ? 'checked' : ''} onpointerdown="pages['plant-details'].onSelectionPointerDown(event, ${r.id})" onclick="pages['plant-details'].onSelectionClick(event, ${r.id})"></td>
@@ -5173,28 +5175,31 @@ pages['purchase-bills'] = {
       el.innerHTML = `
         <div class="stats-grid" style="grid-template-columns:repeat(3,1fr)">
           <div class="stat-card"><div class="stat-n">${rows.length}</div><div class="stat-l">Total purchase bills</div></div>
-          <div class="stat-card"><div class="stat-n" style="color:var(--warn)">${fmtAmt(rows.filter(p=>p.status==='draft').reduce((s,p)=>s+p.total_amount,0))}</div><div class="stat-l">Pending payment</div></div>
-          <div class="stat-card"><div class="stat-n" style="color:var(--success)">${fmtAmt(rows.filter(p=>p.status==='paid').reduce((s,p)=>s+p.total_amount,0))}</div><div class="stat-l">Paid</div></div>
+          <div class="stat-card"><div class="stat-n" style="color:var(--warn)">${fmtAmt(rows.reduce((s,p)=>s+Number(p.outstanding||0),0))}</div><div class="stat-l">Outstanding (accepted qty × deal rate)</div><div class="stat-sub">${rows.filter(p=>p.payment_state==='awaiting_unloading').length} awaiting plant unloading</div></div>
+          <div class="stat-card"><div class="stat-n" style="color:var(--success)">${fmtAmt(rows.reduce((s,p)=>s+Number(p.paid_amount||0),0))}</div><div class="stat-l">Paid</div></div>
         </div>
         <div id="pb-table-wrap" class="tbl-wrap" tabindex="0" onkeydown="pages['purchase-bills'].onSelectionKeydown(event)">
           <table class="tbl">
             <thead><tr>
               <th><input type="checkbox" id="pb-all" onchange="pages['purchase-bills'].toggleSelectAll(this.checked)"></th>
-              <th>PB no.</th><th>Broker</th><th class="r">Qty (Qtl)</th>
-              <th class="r">Rate</th><th class="r">Total</th><th>Date</th><th>Status</th><th></th>
+              <th>PB no.</th><th>Broker</th><th class="r">Billed Qtl</th><th class="r">Accepted Qtl</th>
+              <th class="r">Deal rate</th><th class="r">Payable</th><th class="r">Paid</th><th class="r">Outstanding</th><th>Date</th><th>Status</th><th></th>
             </tr></thead>
             <tbody>
               ${rows.map(p=>`<tr data-pb-id="${p.id}" onmouseenter="pages['purchase-bills'].onSelectionRowEnter(event, ${p.id})">
                 <td><input type="checkbox" class="pb-chk" value="${p.id}" ${this.selectedIds.has(Number(p.id)) ? 'checked' : ''} onpointerdown="pages['purchase-bills'].onSelectionPointerDown(event, ${p.id})" onclick="pages['purchase-bills'].onSelectionClick(event, ${p.id})"></td>
                 <td class="num">${p.pb_number}</td>
                 <td>${p.broker}</td>
-                <td class="num r">${p.qty_mt}</td>
+                <td class="num r">${p.billed_qty_qtl ?? '—'}</td>
+                <td class="num r">${p.payment_state==='awaiting_unloading' ? '<span style="color:var(--muted)">awaiting</span>' : p.qty_mt}</td>
                 <td class="num r">₹${parseFloat(p.rate_per_mt).toLocaleString('en-IN')}</td>
                 <td class="num r">${fmtAmt(p.total_amount)}</td>
+                <td class="num r">${fmtAmt(p.paid_amount)}</td>
+                <td class="num r">${fmtAmt(p.outstanding)}</td>
                 <td>${p.bill_date}</td>
-                <td>${statusPill(p.status)}</td>
+                <td>${statusPill(p.payment_state || p.status)}</td>
                 <td style="display:flex;gap:4px">
-                  ${p.status==='draft'?`<button class="btn btn-xs btn-primary" onclick="pages['purchase-bills'].pay(${p.id},${p.total_amount})">Pay</button>`:''}
+                  ${(p.payment_state==='unpaid'||p.payment_state==='partly_paid')?`<button class="btn btn-xs btn-primary" onclick="pages['purchase-bills'].pay(${p.id},${p.outstanding})">Pay</button>`:''}
                   ${p.status!=='paid'?`<button class="btn btn-xs" onclick="pages['purchase-bills'].deletePB(${p.id})" style="border-color:var(--danger);color:var(--danger)">Delete</button>`:''}
                 </td>
               </tr>`).join('')}
@@ -5242,7 +5247,7 @@ pages['purchase-bills'] = {
         <div class="modal-head">Record payment <button class="btn btn-sm" onclick="closeModal()">✕</button></div>
         <div class="modal-body">
           <div class="form-row">
-            <div class="form-field"><div class="form-label">Amount</div><input class="form-input" id="py-amt" type="number" value="${amount}"></div>
+            <div class="form-field"><div class="form-label">Amount (max outstanding ₹${Number(amount||0).toLocaleString('en-IN')})</div><input class="form-input" id="py-amt" type="number" value="${amount}" max="${amount}"></div>
             <div class="form-field"><div class="form-label">Date</div><input class="form-input" id="py-date" type="date" value="${new Date().toISOString().slice(0,10)}"></div>
           </div>
           <div class="form-row">
@@ -6567,7 +6572,7 @@ pages.reports = {
           ${penalty.length ?
             `<div class="alert-bar"><div class="alert-dot"></div><span style="color:var(--danger)">${penalty.length} items at risk of week-1 penalty</span></div>` +
             `<div class="tbl-wrap"><table class="tbl">
-              <thead><tr><th>Tender</th><th>Plant</th><th>Material</th><th class="r">Target MT</th><th class="r">Accepted MT</th><th class="r">Shortfall</th><th>W1 %</th><th>Deadline</th><th class="r">Est. penalty</th></tr></thead>
+              <thead><tr><th>Tender</th><th>Plant</th><th>Material</th><th class="r">Target Qtl</th><th class="r">Accepted Qtl</th><th class="r">Shortfall</th><th>W1 %</th><th>Deadline</th><th class="r">Est. penalty</th></tr></thead>
               <tbody>${penalty.map(p=>`<tr>
                 <td class="num">${p.tender_number}</td>
                 <td>${p.plant}</td>

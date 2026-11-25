@@ -614,6 +614,59 @@ def _upsert_email_sync_checkpoint(
     )
 
 
+EMAIL_MAX_RETRY_ATTEMPTS = 3
+_RETRY_NOTE_RE = re.compile(r"retry_uid=(\d+) attempts=(\d+)")
+
+
+def _checkpoint_after_errors(
+    db: Session,
+    *,
+    mailbox: str,
+    email_user: str,
+    max_uid_seen: int,
+    errors: list,
+) -> tuple[int, Optional[str]]:
+    """Decide where the UID checkpoint may safely move after a run.
+
+    The checkpoint must not jump past a message that failed, or that bill is lost
+    for good. It stops just before the first failed UID so the next run retries it
+    (attachments already stored are skipped by file-hash dedupe). After
+    EMAIL_MAX_RETRY_ATTEMPTS failed runs on the same UID, it moves on so one broken
+    email cannot block the inbox; that message stays visible as failed in the logs.
+    """
+    failed_uids = []
+    for err in errors or []:
+        if not isinstance(err, dict):
+            continue
+        if str(err.get("error") or "") == "failed to mark seen":
+            continue
+        try:
+            failed_uids.append(int(err.get("uid")))
+        except (TypeError, ValueError):
+            continue
+    if not failed_uids:
+        return max_uid_seen, None
+
+    first_failed = min(failed_uids)
+    prev = get_email_sync_checkpoint(db, mailbox, email_user)
+    attempts = 1
+    m = _RETRY_NOTE_RE.search(str(prev.get("last_error") or ""))
+    if m and int(m.group(1)) == first_failed:
+        attempts = int(m.group(2)) + 1
+
+    if attempts > EMAIL_MAX_RETRY_ATTEMPTS:
+        note = (
+            f"gave_up_uid={first_failed} after {EMAIL_MAX_RETRY_ATTEMPTS} attempts; "
+            f"{len(failed_uids)} item errors this run"
+        )
+        log.error("Email sync %s/%s: giving up on uid=%s after %s attempts", email_user, mailbox, first_failed, EMAIL_MAX_RETRY_ATTEMPTS)
+        return max_uid_seen, note
+
+    hold = max(min(first_failed - 1, max_uid_seen), 0)
+    note = f"retry_uid={first_failed} attempts={attempts}; {len(failed_uids)} item errors this run"
+    return hold, note
+
+
 def _insert_email_sync_log(
     db: Session,
     *,
@@ -1355,6 +1408,12 @@ async def sync_email_pending_ingests(
                 db.commit()
             except Exception as ce:
                 log.warning("Incremental commit failed for uid=%s: %s", uid, ce)
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                # Count it as a failure so the checkpoint does not skip this message.
+                summary["errors"].append({"uid": uid, "error": f"commit failed: {str(ce)[:180]}"})
 
             if mark_seen and unread_only and created_in_msg > 0:
                 try:
@@ -1364,13 +1423,21 @@ async def sync_email_pending_ingests(
 
         summary["end_uid"] = max_uid_seen
         if update_checkpoint:
+            checkpoint_uid, checkpoint_note = _checkpoint_after_errors(
+                db,
+                mailbox=mailbox,
+                email_user=user,
+                max_uid_seen=max_uid_seen,
+                errors=summary["errors"],
+            )
+            summary["end_uid"] = checkpoint_uid
             _upsert_email_sync_checkpoint(
                 db,
                 mailbox=mailbox,
                 email_user=user,
-                last_uid=max_uid_seen,
+                last_uid=checkpoint_uid,
                 status="ok" if not summary["errors"] else "partial",
-                error_text=None if not summary["errors"] else f"{len(summary['errors'])} item errors",
+                error_text=checkpoint_note,
                 scanned=summary["scanned_messages"],
                 created=summary["created"],
                 duplicates=summary["duplicates"],
