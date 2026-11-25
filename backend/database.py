@@ -2,8 +2,9 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from sqlalchemy.pool import QueuePool
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Any, Union
 import os
 
 class Settings(BaseSettings):
@@ -15,6 +16,15 @@ class Settings(BaseSettings):
     host:        str = "0.0.0.0"
     port:        int = 8000
     debug:       bool = True
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug(cls, v):
+        if isinstance(v, str):
+            if v.lower() in ("release", "false", "0", "no", "off"):
+                return False
+            return True
+        return bool(v)
     telegram_token:      str = ""
     webhook_url:         str = ""
     gemini_api_key:      str = ""
