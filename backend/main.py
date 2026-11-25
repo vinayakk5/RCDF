@@ -454,6 +454,20 @@ def _ensure_runtime_schema() -> None:
         _ensure_column(conn, "purchase_bills", "billed_amount", "DECIMAL(14,2) NULL")
         _ensure_column(conn, "purchase_bills", "paid_amount", "DECIMAL(14,2) NOT NULL DEFAULT 0")
 
+        # Per-tender supply window and bill assignment trail.
+        _ensure_column(conn, "tenders", "supply_start", "DATE NULL")
+        _ensure_column(conn, "tenders", "supply_end", "DATE NULL")
+        _ensure_column(conn, "bills", "assignment_status", "VARCHAR(30) NULL")
+        _ensure_column(conn, "bills", "assignment_reason", "TEXT NULL")
+        _ensure_column(conn, "bills", "assignment_candidates", "JSON NULL")
+        # Backfill windows for older tenders: week-1 deadline is start + 7 days.
+        conn.execute(text("""
+            UPDATE tenders
+            SET supply_start = COALESCE(supply_start, DATE_SUB(week1_deadline, INTERVAL 7 DAY)),
+                supply_end = COALESCE(supply_end, week2_deadline)
+            WHERE supply_start IS NULL OR supply_end IS NULL
+        """))
+
         _ensure_column(conn, "busy_exports", "company_id", "INT NULL")
         _ensure_column(conn, "busy_exports", "main_tender_id", "INT NULL")
         _ensure_column(conn, "busy_exports", "created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP")
@@ -758,6 +772,8 @@ class TenderCreate(BaseModel):
     week1_target_mt: float
     week1_deadline:  date
     week2_deadline:  date
+    supply_start:    Optional[date] = None   # this tender's own supply period
+    supply_end:      Optional[date] = None   # update when a time-extension order arrives
     penalty_pct:     float = 20.0
     notes:           Optional[str] = None
 
@@ -1039,6 +1055,8 @@ def _tender_to_dict(t: Tender, db: Session = None) -> dict:
         "week1_target_mt": w1_target,
         "week1_deadline": str(t.week1_deadline),
         "week2_deadline": str(t.week2_deadline),
+        "supply_start": str(t.supply_start) if t.supply_start else None,
+        "supply_end": str(t.supply_end) if t.supply_end else None,
         "status": t.status.value,
         "penalty_pct": float(t.penalty_pct),
         "notes": t.notes,
@@ -1106,6 +1124,9 @@ def _bill_to_dict(b: Bill) -> dict:
         "unloading_match_entry_id": b.unloading_match_entry_id,
         "unloading_match_master_id": b.unloading_match_master_id,
         "unloading_match_method": b.unloading_match_method,
+        "assignment_status": b.assignment_status,
+        "assignment_reason": b.assignment_reason,
+        "assignment_candidates": b.assignment_candidates or [],
         "created_at": str(b.created_at),
     }
 
@@ -1284,13 +1305,21 @@ def _find_unloading_entry_match_for_bill(
             continue
         if occupied_entry_ids and (entry.id in occupied_entry_ids):
             continue
+        entry_company = entry.company_id if entry.company_id is not None else (entry.master.company_id if entry.master else None)
+        if b.company_id is not None and entry_company is not None and entry_company != b.company_id:
+            continue
 
         matched_entries.append(entry)
 
         status_rank = 2 if entry.status == BillStatus.approved else (1 if entry.status == BillStatus.linked else 0)
         lineage_rank = 1 if (entry.tender_id or (entry.master and entry.master.tender_id)) else 0
         if b.bill_date and entry.entry_date:
-            proximity_rank = -abs((entry.entry_date - b.bill_date).days)
+            gap_days = (entry.entry_date - b.bill_date).days
+            # Unloading happens after loading, within days; a far-off row is a
+            # different trip of the same truck.
+            if gap_days < -2 or gap_days > RECEIPT_MATCH_MAX_DAYS:
+                continue
+            proximity_rank = -abs(gap_days)
         else:
             proximity_rank = 0
 
@@ -1435,6 +1464,152 @@ def _reconcile_unloading_match_for_bill_ids(db: Session, bill_ids: List[Optional
     return changed
 
 
+LATE_BILL_GRACE_DAYS = int(os.getenv("LATE_BILL_GRACE_DAYS", "15"))   # bills usually 5-10 days late
+EARLY_BILL_DAYS = int(os.getenv("EARLY_BILL_DAYS", "3"))
+ASSIGN_MIN_LEAD = 1.0   # best candidate must beat the runner-up by this many points
+
+
+def _tender_supply_window(t: Tender) -> tuple[Optional[date], Optional[date]]:
+    """A tender's own supply period. Never the shared cycle: cycles overlap."""
+    start = t.supply_start
+    end = t.supply_end
+    if start is None and t.week1_deadline:
+        start = t.week1_deadline - timedelta(days=7)
+    if end is None:
+        end = t.week2_deadline
+    return start, end
+
+
+def _score_deal_for_bill(bill: Bill, deal: Deal, plant_id: Optional[int], material_id: Optional[int]) -> Optional[dict]:
+    """Score one open deal for a bill. None means the deal is ruled out."""
+    t = deal.tender
+    if t is None or deal.status == DealStatus.cancelled or t.status == TenderStatus.cancelled:
+        return None
+    if bill.company_id is not None and deal.company_id is not None and deal.company_id != bill.company_id:
+        return None
+    if plant_id is not None and t.plant_id != plant_id:
+        return None
+    if material_id is not None and deal.material_id != material_id:
+        return None
+
+    score = 0.0
+    why: List[str] = []
+    start, end = _tender_supply_window(t)
+    bd = bill.bill_date
+    if bd and start and end:
+        if start <= bd <= end:
+            score += 3.0
+            why.append(f"bill date {bd} inside supply period {start}..{end}")
+        elif end < bd <= end + timedelta(days=LATE_BILL_GRACE_DAYS):
+            late = (bd - end).days
+            score += 2.0 - late / LATE_BILL_GRACE_DAYS
+            why.append(f"bill date {late}d after supply end {end} (late-bill window)")
+        elif start - timedelta(days=EARLY_BILL_DAYS) <= bd < start:
+            score += 1.0
+            why.append(f"bill date {(start - bd).days}d before supply start {start}")
+        else:
+            return None
+    elif not bd:
+        why.append("bill date unknown")
+
+    deal_rate = float(deal.rate_per_mt or 0)
+    bill_rate = float(bill.rate_per_mt or 0)
+    if deal_rate > 0 and bill_rate > 0:
+        diff = abs(bill_rate - deal_rate) / deal_rate
+        if diff <= 0.02:
+            score += 2.0
+            why.append(f"rate ₹{bill_rate:g} matches deal ₹{deal_rate:g}")
+        elif diff <= 0.05:
+            score += 1.0
+            why.append(f"rate ₹{bill_rate:g} close to deal ₹{deal_rate:g}")
+        elif diff > 0.10:
+            score -= 1.0
+            why.append(f"rate ₹{bill_rate:g} far from deal ₹{deal_rate:g}")
+
+    if bill.broker_id and deal.broker_id:
+        if bill.broker_id == deal.broker_id:
+            score += 1.5
+            why.append("same broker")
+        else:
+            score -= 1.0
+
+    remaining = float(deal.deal_mt or 0) - float(deal.dispatched_mt or 0)
+    qty = float(bill.qty_mt or 0)
+    if qty > 0:
+        if remaining >= qty - 0.5:
+            score += 1.0
+            why.append(f"deal has {remaining:g} qtl open")
+        elif remaining > 0:
+            why.append(f"deal has only {remaining:g} qtl open")
+        else:
+            score -= 2.0
+            why.append("deal already fully billed")
+
+    return {
+        "deal_id": deal.id,
+        "deal_number": deal.deal_number,
+        "tender_id": t.id,
+        "tender_number": t.tender_number,
+        "company_id": deal.company_id,
+        "supply_start": str(start) if start else None,
+        "supply_end": str(end) if end else None,
+        "score": round(score, 2),
+        "why": why,
+    }
+
+
+def _rank_deals_for_bill(db: Session, bill: Bill) -> List[dict]:
+    plant_id = bill.plant_id
+    if not plant_id and bill.plant_name:
+        plant_id, _ = _resolve_plant(db, bill.plant_name)
+    material_id, _ = _resolve_material(db, material_id=bill.material_id, material_name=bill.material_name)
+    q = select(Deal).where(Deal.status != DealStatus.cancelled)
+    if bill.company_id is not None:
+        q = q.where(or_(Deal.company_id == bill.company_id, Deal.company_id == None))
+    ranked = []
+    for deal in db.execute(q).scalars().all():
+        c = _score_deal_for_bill(bill, deal, plant_id, material_id)
+        if c:
+            ranked.append(c)
+    ranked.sort(key=lambda c: c["score"], reverse=True)
+    return ranked
+
+
+def _assign_bill_to_deal(db: Session, bill: Bill) -> Optional[Deal]:
+    """Pick the deal (and so firm + tender) for a bill by scoring, never by recency.
+
+    Overlapping tenders are separated by each tender's own supply window checked
+    against the BILL date (late bills are allowed LATE_BILL_GRACE_DAYS after the
+    window). A deal is chosen only when it clearly beats the runner-up; otherwise
+    the bill is left for review with the candidates recorded.
+    """
+    ranked = _rank_deals_for_bill(db, bill)
+    bill.assignment_candidates = ranked[:5]
+    if not ranked:
+        bill.assignment_status = "no_candidate"
+        bill.assignment_reason = (
+            "No open deal matches this bill's firm, plant, material and bill date. "
+            "Create the deal or assign manually."
+        )
+        return None
+    best = ranked[0]
+    runner = ranked[1] if len(ranked) > 1 else None
+    if runner and best["score"] - runner["score"] < ASSIGN_MIN_LEAD:
+        bill.assignment_status = "ambiguous"
+        bill.assignment_reason = (
+            f"Two deals fit almost equally: {best['deal_number']} ({best['tender_number']}, score {best['score']}) "
+            f"and {runner['deal_number']} ({runner['tender_number']}, score {runner['score']}). Choose one."
+        )
+        return None
+    if best["score"] < 2.0:
+        bill.assignment_status = "weak"
+        bill.assignment_reason = f"Best match {best['deal_number']} is weak ({'; '.join(best['why'])}). Confirm manually."
+        return None
+    bill.assignment_status = "auto"
+    bill.assignment_reason = f"{best['deal_number']} / {best['tender_number']}: " + "; ".join(best["why"])
+    return db.get(Deal, best["deal_id"])
+
+
 def _auto_assign_bill_to_deal_and_dispatch(db: Session, bill: Bill) -> Optional[Deal]:
     """Auto-assign uploaded bill to matching active Deal, Tender, and create Dispatch in_transit."""
     if not bill or bill.deal_id:
@@ -1470,37 +1645,17 @@ def _auto_assign_bill_to_deal_and_dispatch(db: Session, bill: Bill) -> Optional[
             material_id = m_obj.id
             bill.material_id = m_obj.id
 
-    # 4. Search candidate active Deals
-    q = select(Deal).join(Tender, Deal.tender_id == Tender.id)
-    if broker_id:
-        q = q.where(Deal.broker_id == broker_id)
-    if plant_id:
-        q = q.where(Tender.plant_id == plant_id)
-    if material_id:
-        q = q.where(Deal.material_id == material_id)
-    
-    q = q.where(Deal.status.in_([DealStatus.active, DealStatus.partial]))
-    q = q.order_by(desc(Deal.created_at))
-    candidate_deals = db.execute(q).scalars().all()
-
-    if not candidate_deals and (broker_id or plant_id or material_id):
-        q2 = select(Deal).join(Tender, Deal.tender_id == Tender.id)
-        if broker_id:
-            q2 = q2.where(Deal.broker_id == broker_id)
-        elif plant_id:
-            q2 = q2.where(Tender.plant_id == plant_id)
-        q2 = q2.where(Deal.status.in_([DealStatus.active, DealStatus.partial]))
-        q2 = q2.order_by(desc(Deal.created_at))
-        candidate_deals = db.execute(q2).scalars().all()
-
-    if candidate_deals:
-        matched_deal = candidate_deals[0]
+    # 4. Score candidate deals (firm, plant, material, bill date vs each tender's
+    #    own supply window, rate, broker, open quantity). Never "newest deal wins".
+    matched_deal = _assign_bill_to_deal(db, bill)
+    if matched_deal:
         bill.deal_id = matched_deal.id
         bill.tender_id = matched_deal.tender_id
         bill.main_tender_id = matched_deal.main_tender_id
         bill.company_id = matched_deal.company_id
         bill.broker_id = matched_deal.broker_id
-        bill.material_id = matched_deal.material_id
+        if not bill.material_id:
+            bill.material_id = matched_deal.material_id
         bill.status = BillStatus.linked
         db.flush()
 
@@ -1527,6 +1682,11 @@ def _auto_assign_bill_to_deal_and_dispatch(db: Session, bill: Bill) -> Optional[
                 )
                 db.add(disp)
                 db.flush()
+                # A late bill may arrive after the plant already unloaded the truck.
+                _auto_match_open_receipt_for_dispatch(db, disp)
+                db.flush()
+                _refresh_dispatch_status(db, disp.id)
+                _recalculate_deal_dispatched_mt(db, [matched_deal.id])
         return matched_deal
 
     return None
@@ -2912,6 +3072,26 @@ def _enrich_receipt_material(db: Session, r: PlantReceipt) -> None:
     r.material_name = rname
 
 
+RECEIPT_MATCH_MAX_DAYS = int(os.getenv("RECEIPT_MATCH_MAX_DAYS", "20"))
+
+
+def _closest_trip(items: list, ref_date: Optional[date], date_of) -> list:
+    """When the same truck has several trips, keep only the clearly closest one.
+
+    "Clearly" = at least 3 days nearer than the next candidate; otherwise all are
+    returned so the caller marks the match ambiguous for review.
+    """
+    if len(items) <= 1 or ref_date is None:
+        return items
+    dated = [(abs((date_of(x) - ref_date).days), x) for x in items if date_of(x) is not None]
+    if len(dated) != len(items):
+        return items
+    dated.sort(key=lambda t: t[0])
+    if dated[1][0] - dated[0][0] >= 3:
+        return [dated[0][1]]
+    return items
+
+
 def _match_receipt_to_dispatch(db: Session, r: PlantReceipt, manual: bool = False) -> Optional[int]:
     # If manually linked, trust dispatch_id and mark manual.
     if manual and r.dispatch_id:
@@ -2939,6 +3119,9 @@ def _match_receipt_to_dispatch(db: Session, r: PlantReceipt, manual: bool = Fals
     for d in candidates:
         if _norm_vehicle(d.vehicle_number) != truck:
             continue
+        # Our three firms can use the same truck: never cross firms.
+        if r.company_id is not None and d.company_id is not None and r.company_id != d.company_id:
+            continue
         if _dispatch_remaining_qtl(d) <= 0:
             continue
         other_receipt = _active_receipt_for_dispatch(db, d.id, exclude_receipt_id=r.id)
@@ -2949,7 +3132,13 @@ def _match_receipt_to_dispatch(db: Session, r: PlantReceipt, manual: bool = Fals
             r.match_status = "flagged_date"
             r.match_reason = f"Receipt date ({r.receipt_date}) is earlier than dispatch date ({d.dispatch_date})"
             continue
+        # A truck reaches the plant within days, not months: same truck on a
+        # later trip must not be matched to an old dispatch.
+        if r.receipt_date and d.dispatch_date and (r.receipt_date - d.dispatch_date).days > RECEIPT_MATCH_MAX_DAYS:
+            continue
         filtered.append(d)
+
+    filtered = _closest_trip(filtered, r.receipt_date, lambda d: d.dispatch_date)
 
     if len(filtered) == 1:
         d = filtered[0]
@@ -3049,7 +3238,14 @@ def _auto_match_open_receipt_for_dispatch(db: Session, d: Dispatch) -> Optional[
     for r in candidates:
         if _norm_vehicle(r.vehicle_number) != truck:
             continue
+        if r.company_id is not None and d.company_id is not None and r.company_id != d.company_id:
+            continue
+        if r.receipt_date and d.dispatch_date:
+            gap = (r.receipt_date - d.dispatch_date).days
+            if gap < 0 or gap > RECEIPT_MATCH_MAX_DAYS:
+                continue
         eligible.append(r)
+    eligible = _closest_trip(eligible, d.dispatch_date, lambda r: r.receipt_date)
 
     if len(eligible) != 1:
         if len(eligible) > 1:
@@ -4959,8 +5155,14 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
         )
         db.add(b)
         db.flush()
+        _auto_assign_bill_to_deal_and_dispatch(db, b)
         _reconcile_unloading_match_for_bill_ids(db, [b.id])
-        return {"created_bill_id": b.id, "document_type": doc_type}
+        return {
+            "created_bill_id": b.id,
+            "document_type": doc_type,
+            "assignment_status": b.assignment_status,
+            "assignment_reason": b.assignment_reason,
+        }
 
     if doc_type == "plant_unloading":
         image_name = Path(p.file_path).name
@@ -5351,6 +5553,8 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
                         week1_target_mt=round(qty / 2.0, 3),
                         week1_deadline=week1_deadline,
                         week2_deadline=supply_end,
+                        supply_start=supply_start,
+                        supply_end=supply_end,
                         status=TenderStatus.active,
                         notes=f"Auto-created from PO {po_number}",
                     )
@@ -5362,6 +5566,8 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
                     t.week1_target_mt = round(qty / 2.0, 3)
                     t.week1_deadline = week1_deadline
                     t.week2_deadline = supply_end
+                    t.supply_start = supply_start
+                    t.supply_end = supply_end
                     t.cycle_id = cycle.id
                     t.status = TenderStatus.active
                 created_tender_ids.append(t.id)
@@ -6355,6 +6561,10 @@ def create_tender(data: TenderCreate, company_id: Optional[int] = Query(None),
     payload["main_tender_id"] = mt_id
     t = Tender(**payload)
     t.status = TenderStatus.active
+    if t.supply_start is None and t.week1_deadline:
+        t.supply_start = t.week1_deadline - timedelta(days=7)
+    if t.supply_end is None:
+        t.supply_end = t.week2_deadline
     db.add(t); db.commit(); db.refresh(t)
     return _tender_to_dict(t)
 
@@ -6691,6 +6901,36 @@ def ensure_dispatches(company_id: Optional[int] = None, main_tender_id: Optional
     db.commit()
     return {'created': created, 'count': len(created)}
 
+@app.get("/api/bills/{bill_id}/deal-candidates")
+def bill_deal_candidates(bill_id: int, db: Session = Depends(get_db)):
+    """Ranked deals for a bill with the reasons, for the review screen."""
+    b = db.get(Bill, bill_id)
+    if not b:
+        raise HTTPException(404, "Bill not found")
+    return {
+        "bill_id": b.id,
+        "assignment_status": b.assignment_status,
+        "assignment_reason": b.assignment_reason,
+        "candidates": _rank_deals_for_bill(db, b)[:8],
+    }
+
+
+@app.post("/api/bills/auto-assign")
+def auto_assign_open_bills(db: Session = Depends(get_db)):
+    """Re-run scored assignment for every bill without a deal (e.g. after new deals are entered)."""
+    bills = db.execute(select(Bill).where(Bill.deal_id == None, Bill.status != BillStatus.rejected)).scalars().all()
+    summary = {"checked": 0, "assigned": 0, "ambiguous": 0, "no_candidate": 0, "weak": 0}
+    for b in bills:
+        summary["checked"] += 1
+        deal = _auto_assign_bill_to_deal_and_dispatch(db, b)
+        if deal:
+            summary["assigned"] += 1
+        elif b.assignment_status in summary:
+            summary[b.assignment_status] += 1
+    db.commit()
+    return summary
+
+
 @app.patch("/api/bills/{bill_id}/link/{deal_id}")
 def link_bill_to_deal(bill_id: int, deal_id: int, company_id: Optional[int] = None,
                       main_tender_id: Optional[int] = None, tender_id: Optional[int] = None,
@@ -6710,6 +6950,8 @@ def link_bill_to_deal(bill_id: int, deal_id: int, company_id: Optional[int] = No
 
     b.deal_id = deal_id
     _stamp_lineage(b, dc, dm, dt)
+    b.assignment_status = "manual"
+    b.assignment_reason = f"Linked manually to deal #{deal_id}"
     if b.status == BillStatus.approved:
         b.status = BillStatus.linked
 
@@ -10269,6 +10511,75 @@ def penalty_risk_report(cycle_id: Optional[int] = None, company_id: Optional[int
             })
     return sorted(at_risk, key=lambda x: x["week1_pct"])
 
+def _deal_fulfilment_rows(db: Session, company_id: Optional[int] = None, today: Optional[date] = None) -> List[dict]:
+    """Per deal: contracted vs billed / at plant / accepted / rejected, and whether it is behind.
+
+    "Behind" compares billed quantity with where the deal should be by now if
+    supply were spread evenly over the tender's own supply period.
+    """
+    today = today or date.today()
+    q = select(Deal).where(Deal.status != DealStatus.cancelled)
+    if company_id is not None:
+        q = q.where(Deal.company_id == company_id)
+    rows = []
+    for d in db.execute(q).scalars().all():
+        t = d.tender
+        bills = db.execute(select(Bill).where(Bill.deal_id == d.id, Bill.status != BillStatus.rejected)).scalars().all()
+        billed = round(sum(float(b.qty_mt or 0) for b in bills), 3)
+        deal_qty = float(d.deal_mt or 0)
+        accepted = float(d.accepted_mt or 0)
+        rejected = float(d.rejected_mt or 0)
+        start, end = _tender_supply_window(t) if t else (None, None)
+        expected = None
+        days_left = None
+        if start and end and end >= start:
+            span = max((end - start).days, 1)
+            elapsed = min(max((today - start).days, 0), span)
+            expected = round(deal_qty * elapsed / span, 1)
+            days_left = (end - today).days
+        remaining = round(max(deal_qty - billed, 0), 3)
+        if remaining <= 0.5:
+            state = "fulfilled"
+        elif days_left is not None and days_left < 0:
+            state = "overdue"
+        elif expected is not None and billed < 0.8 * expected:
+            state = "behind"
+        else:
+            state = "on_track"
+        rows.append({
+            "deal_id": d.id,
+            "deal_number": d.deal_number,
+            "broker": d.broker.name if d.broker else None,
+            "broker_phone": d.broker.phone if d.broker else None,
+            "company_id": d.company_id,
+            "tender_number": t.tender_number if t else None,
+            "plant": t.plant.name if t and t.plant else None,
+            "material": d.material.name if d.material else None,
+            "deal_qtl": deal_qty,
+            "rate_per_qtl": float(d.rate_per_mt or 0),
+            "bills": len(bills),
+            "billed_qtl": billed,
+            "accepted_qtl": accepted,
+            "rejected_qtl": rejected,
+            "remaining_qtl": remaining,
+            "rebuy_needed_qtl": rejected,
+            "expected_by_today_qtl": expected,
+            "supply_start": str(start) if start else None,
+            "supply_end": str(end) if end else None,
+            "days_left": days_left,
+            "state": state,
+        })
+    order = {"overdue": 0, "behind": 1, "on_track": 2, "fulfilled": 3}
+    rows.sort(key=lambda r: (order[r["state"]], r["days_left"] if r["days_left"] is not None else 999))
+    return rows
+
+
+@app.get("/api/reports/deal-fulfilment")
+def deal_fulfilment_report(company_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """Which broker deals still owe material, and which are behind schedule (call them)."""
+    return _deal_fulfilment_rows(db, company_id=company_id)
+
+
 @app.get("/api/reports/broker-performance")
 def broker_performance(company_id: Optional[int] = None, main_tender_id: Optional[int] = None,
                        db: Session = Depends(get_db)):
@@ -10300,8 +10611,13 @@ def update_tender(tender_id: int, data: TenderCreate, company_id: Optional[int] 
                   main_tender_id: Optional[int] = None, db: Session = Depends(get_db)):
     t = db.get(Tender, tender_id)
     _assert_record_scope(t, company_id, main_tender_id, label="Tender")
-    for k, v in data.model_dump().items():
+    # exclude_unset: a client that does not send supply_start/end must not wipe them.
+    for k, v in data.model_dump(exclude_unset=True).items():
         setattr(t, k, v)
+    if t.supply_start is None:
+        t.supply_start = t.week1_deadline - timedelta(days=7) if t.week1_deadline else None
+    if t.supply_end is None:
+        t.supply_end = t.week2_deadline
     db.commit()
     return _tender_to_dict(t)
 

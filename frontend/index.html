@@ -2332,7 +2332,7 @@ pages.tenders = {
                 <button class="btn btn-xs" onclick="event.stopPropagation();pages.tenders.openEdit(${t.id})" style="margin-left:4px">Edit</button>
                 <button class="btn btn-xs btn-danger" onclick="event.stopPropagation();pages.tenders.deleteTender(${t.id})" style="border-color:var(--danger);color:var(--danger)">Delete</button>
               </div>
-              <div style="font-size:11px;color:var(--muted);margin-top:2px">W1: ${t.week1_deadline} · W2: ${t.week2_deadline}</div>
+              <div style="font-size:11px;color:var(--muted);margin-top:2px">Supply: ${t.supply_start || '?'} → ${t.supply_end || '?'} · W1: ${t.week1_deadline}</div>
             </div>
             <div style="text-align:right;margin-right:16px">
               <div class="num" style="color:${barColor(s.accepted_pct)}">${s.accepted_pct}%</div>
@@ -2564,6 +2564,10 @@ pages.tenders = {
             <div class="form-field"><div class="form-label">Week 1 deadline</div><input class="form-input" id="tf-d1" type="date" value="${t.week1_deadline}"></div>
             <div class="form-field"><div class="form-label">Week 2 deadline</div><input class="form-input" id="tf-d2" type="date" value="${t.week2_deadline}"></div>
           </div>
+          <div class="form-row">
+            <div class="form-field"><div class="form-label">Supply period from</div><input class="form-input" id="tf-ss" type="date" value="${t.supply_start || ''}"></div>
+            <div class="form-field"><div class="form-label">Supply period to <span style="color:var(--muted);font-weight:400">(change on time extension)</span></div><input class="form-input" id="tf-se" type="date" value="${t.supply_end || ''}"></div>
+          </div>
           <div class="form-field">
             <div class="form-label">Status</div>
             <select class="form-select" id="tf-status">
@@ -2592,6 +2596,8 @@ pages.tenders = {
       week1_target_mt: parseFloat(document.getElementById('tf-w1').value),
       week1_deadline:  document.getElementById('tf-d1').value,
       week2_deadline:  document.getElementById('tf-d2').value,
+      supply_start:    document.getElementById('tf-ss').value || null,
+      supply_end:      document.getElementById('tf-se').value || null,
     };
     try {
       await apiFetch(`/tenders/${id}`, { method: 'PUT', body: JSON.stringify(body) });
@@ -6589,11 +6595,34 @@ pages.reports = {
     const el = document.getElementById('page-reports');
     el.innerHTML = '<div class="loading">Loading reports</div>';
     try {
-      const [penalty, brokers] = await Promise.all([
+      const [penalty, brokers, deals] = await Promise.all([
         apiFetch('/reports/penalty-risk'),
         apiFetch('/reports/broker-performance'),
+        apiFetch('/reports/deal-fulfilment').catch(() => []),
       ]);
+      const stateLabel = {overdue:'overdue', behind:'behind — call broker', on_track:'on track', fulfilled:'fulfilled'};
+      const stateCls = {overdue:'pill-danger', behind:'pill-pending', on_track:'pill-active', fulfilled:'pill-info'};
+      const dealRows = (deals || []);
       el.innerHTML = `
+        <div style="margin-bottom:16px">
+          <div class="sec-header"><div class="sec-title">Deal fulfilment</div></div>
+          ${dealRows.length ? `<div class="tbl-wrap"><table class="tbl">
+            <thead><tr><th>Deal</th><th>Broker</th><th>Tender</th><th class="r">Deal Qtl</th><th class="r">Billed</th><th class="r">Accepted</th><th class="r">Rejected (rebuy)</th><th class="r">Still owed</th><th>Supply ends</th><th>Status</th></tr></thead>
+            <tbody>${dealRows.map(d=>`<tr>
+              <td class="num">${escapeHtml(d.deal_number)}</td>
+              <td>${escapeHtml(d.broker || '—')}${d.broker_phone ? `<div style="font-size:10px;color:var(--muted)">${escapeHtml(d.broker_phone)}</div>` : ''}</td>
+              <td style="font-size:11px">${escapeHtml(d.tender_number || '—')}</td>
+              <td class="num r">${d.deal_qtl}</td>
+              <td class="num r">${d.billed_qtl}${d.expected_by_today_qtl!=null ? `<div style="font-size:10px;color:var(--muted)">expected ${d.expected_by_today_qtl}</div>` : ''}</td>
+              <td class="num r ok">${d.accepted_qtl}</td>
+              <td class="num r ${d.rejected_qtl>0?'danger':'muted'}">${d.rejected_qtl||'—'}</td>
+              <td class="num r">${d.remaining_qtl}</td>
+              <td>${d.supply_end || '—'}${d.days_left!=null ? `<div style="font-size:10px;color:var(--muted)">${d.days_left>=0 ? d.days_left + ' days left' : (-d.days_left) + ' days ago'}</div>` : ''}</td>
+              <td><span class="pill ${stateCls[d.state]||'pill-muted'}">${stateLabel[d.state]||d.state}</span></td>
+            </tr>`).join('')}</tbody>
+          </table></div>` : '<div style="padding:14px;color:var(--muted);font-size:13px">No deals yet.</div>'}
+        </div>
+
         <div style="margin-bottom:16px">
           <div class="sec-header"><div class="sec-title">Penalty risk report</div></div>
           ${penalty.length ?

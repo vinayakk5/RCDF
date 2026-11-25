@@ -179,6 +179,10 @@ class Tender(Base):
     week1_target_mt = Column(Numeric(10, 2), nullable=False)
     week1_deadline  = Column(Date, nullable=False)
     week2_deadline  = Column(Date, nullable=False)
+    # This tender's own supply period (from its PO / extension orders). Bills are
+    # assigned by bill date against this window, never by arrival date.
+    supply_start    = Column(Date, nullable=True)
+    supply_end      = Column(Date, nullable=True)
     penalty_pct     = Column(Numeric(5, 2), default=20.00)
     status          = Column(Enum(TenderStatus), default=TenderStatus.pending)
     notes           = Column(Text)
@@ -250,6 +254,10 @@ class Bill(Base):
     validation_vehicle  = Column(Boolean, default=False)
     validation_material = Column(Boolean, default=False)
     status           = Column(Enum(BillStatus), default=BillStatus.pending)
+    # How this bill was matched to firm/tender/deal (see _assign_bill_to_deal).
+    assignment_status     = Column(String(30), nullable=True)
+    assignment_reason     = Column(Text, nullable=True)
+    assignment_candidates = Column(JSON, nullable=True)
     reviewed_by      = Column(String(100))
     reviewed_at      = Column(DateTime)
     notes            = Column(Text)
