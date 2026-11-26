@@ -388,24 +388,24 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
     <div class="logo-sub">Operations Platform</div>
   </div>
   <nav class="nav">
-    <div class="nav-section">Overview</div>
-    <div class="nav-item active" onclick="nav('home',this)">
+    <div class="nav-section">Work</div>
+    <div class="nav-item active" onclick="nav('rms',this)">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12v9a1 1 0 01-1 1H3a1 1 0 01-1-1V4z"/><path d="M5 4V2.5a.5.5 0 01.5-.5h5a.5.5 0 01.5.5V4"/><path d="M2 8h12"/></svg>
+      Tenders (RM)
+    </div>
+    <div class="nav-item" onclick="nav('home',this)">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 7.5L8 2l6 5.5V14a1 1 0 0 1-1 1h-3.5v-4h-3v4H3a1 1 0 0 1-1-1V7.5z"/></svg>
-      Home
+      Today
     </div>
     <div class="nav-item" onclick="nav('dashboard',this)">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="6" height="6" rx="1"/><rect x="9" y="1" width="6" height="6" rx="1"/><rect x="1" y="9" width="6" height="6" rx="1"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
       Dashboard
     </div>
-    <div class="nav-item" onclick="nav('audit',this)">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h12v4H2z"/><path d="M2 9h12v4H2z"/></svg>
-      Audit Logs
-    </div>
 
-    <div class="nav-section">Procurement</div>
+    <div class="nav-section">Tender records</div>
     <div class="nav-item" onclick="nav('tenders',this)">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12v9a1 1 0 01-1 1H3a1 1 0 01-1-1V4z"/><path d="M5 4V2.5a.5.5 0 01.5-.5h5a.5.5 0 01.5.5V4"/></svg>
-      Tenders
+      Sub-tenders
     </div>
     <div class="nav-item" onclick="nav('deals',this)">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 12V4l4 4 3-5 3 4 2-3v8H2z"/></svg>
@@ -424,7 +424,7 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
     </div>
     <div class="nav-item" onclick="nav('pending-ingests',this)">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 2h10v12H3z"/><path d="M5 5h6"/><path d="M5 8h6"/><path d="M5 11h4"/></svg>
-      Pending Ingests
+      Inbox (to check)
       <span class="nav-badge nb-info" id="nb-ingests">0</span>
     </div>
     <div class="nav-item" onclick="nav('whatsapp',this)">
@@ -488,6 +488,10 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="5" r="3"/><path d="M1 14c0-3 2.5-5 5-5s5 2 5 5"/><path d="M13 8a2 2 0 100-4"/><path d="M16 14c0-2-1-3.5-3-4"/></svg>
       Brokers
     </div>
+    <div class="nav-item" onclick="nav('audit',this)">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h12v4H2z"/><path d="M2 9h12v4H2z"/></svg>
+      Audit Logs
+    </div>
   </nav>
   <div class="sidebar-footer">
     <div class="user-chip" id="user-chip" style="display:none">
@@ -513,6 +517,8 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
   <div class="contextbar" id="context-bar"></div>
 
   <!-- PAGES -->
+  <div id="page-rms" class="page" style="overflow-y:auto;"></div>
+  <div id="page-rm" class="page" style="overflow-y:auto;"></div>
   <div id="page-home" class="page active" style="overflow-y:auto;"></div>
   <div id="page-dashboard" class="page" style="overflow-y:auto;"></div>
   <div id="page-tenders" class="page" style="overflow-y:auto;"></div>
@@ -550,9 +556,9 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
 
 <!-- BOTTOM NAV (phones only) -->
 <nav class="bottom-nav" id="bottom-nav">
-  <button class="bn-item active" data-page="home" onclick="nav('home')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 7.5L8 2l6 5.5V14a1 1 0 0 1-1 1h-3.5v-4h-3v4H3a1 1 0 0 1-1-1V7.5z"/></svg>Today</button>
+  <button class="bn-item active" data-page="rms" onclick="nav('rms')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12v9a1 1 0 01-1 1H3a1 1 0 01-1-1V4z"/><path d="M5 4V2.5a.5.5 0 01.5-.5h5a.5.5 0 01.5.5V4"/></svg>Tenders</button>
+  <button class="bn-item" data-page="pending-ingests" onclick="nav('pending-ingests')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 2h10v12H3z"/><path d="M5 5h6"/><path d="M5 8h6"/><path d="M5 11h4"/></svg>Inbox</button>
   <button class="bn-item" data-page="bills" onclick="nav('bills')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="12" height="12" rx="2"/><line x1="5" y1="6" x2="11" y2="6"/><line x1="5" y1="9" x2="9" y2="9"/></svg>Bills</button>
-  <button class="bn-item" data-page="plant-details" onclick="nav('plant-details')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="7" width="10" height="7" rx="1"/><path d="M11 9l3-2v6l-3-2"/></svg>Plant</button>
   <button class="bn-item" data-page="payments" onclick="nav('payments')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="4" width="14" height="9" rx="1.5"/><line x1="1" y1="7" x2="15" y2="7"/></svg>Pay</button>
   <button class="bn-item" data-page="more" onclick="toggleSidebar(true)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="3" cy="8" r="1.2"/><circle cx="8" cy="8" r="1.2"/><circle cx="13" cy="8" r="1.2"/></svg>More</button>
 </nav>
@@ -8704,7 +8710,8 @@ pages.users = {
 };
 
 // ── Boot ───────────────────────────────────────────────────────────────────
-(async () => {
+// Runs after workspace.js (the firm -> RM layer) has loaded.
+window.addEventListener('DOMContentLoaded', async () => {
   loadContextFromStorage();
   if (!(await auth.init())) return;   // login screen shown; boot resumes after login
   await loadRef();
@@ -8712,8 +8719,11 @@ pages.users = {
   if (canAccessWorkspace('dashboard')) {
     try { state.deals = await apiFetch('/deals'); } catch {}
   }
-  nav('home');
-})();
+  if (window.ws && ws.startFromHash()) return;
+  nav(window.ws ? 'rms' : 'home');
+});
 </script>
+<link rel="stylesheet" href="/static/workspace.css?v=1">
+<script src="/static/workspace.js?v=1"></script>
 </body>
 </html>

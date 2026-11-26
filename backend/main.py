@@ -29,6 +29,29 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def _setup_file_log() -> None:
+    """Also write logs to backend/logs/app.log (rotated), so errors can be looked at later."""
+    from logging.handlers import RotatingFileHandler
+    if os.getenv("LOG_TO_FILE", "true").lower() in ("0", "false", "no"):
+        return
+    try:
+        log_dir = Path(__file__).resolve().parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        root = logging.getLogger()
+        if any(isinstance(h, RotatingFileHandler) for h in root.handlers):
+            return
+        h = RotatingFileHandler(log_dir / "app.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"))
+        h.setLevel(logging.INFO)
+        root.addHandler(h)
+        logging.getLogger("uvicorn.error").addHandler(h)
+    except Exception as e:  # never stop the app over logging
+        log.warning("File log not set up: %s", e)
+
+
+_setup_file_log()
+
+
 def _ensure_runtime_schema() -> None:
     """Create new runtime tables if missing (lightweight alternative to migrations)."""
     def _column_exists(conn, table_name: str, column_name: str) -> bool:
@@ -4955,7 +4978,11 @@ def _purchase_order_to_dict(po: PurchaseOrder) -> dict:
         "buyer_email": po.buyer_email,
         "plant_id": po.plant_id,
         "plant_name": po.plant_name,
+        # total_amount is the figure printed on the PO document (it can include lines
+        # approved to other parties); our_amount / our_qty_qtl count only our lines.
         "total_amount": float(po.total_amount) if po.total_amount is not None else None,
+        **_po_our_figures(po),
+        "doc_url": _upload_url(po.source_doc_path),
         "line_items": po.line_items or [],
         "status": po.status.value if po.status else None,
         "source": po.source,
@@ -4972,7 +4999,10 @@ def _purchase_order_subtender_preview(db: Session, po: PurchaseOrder) -> dict:
     warnings: List[str] = []
 
     items = po.line_items if isinstance(po.line_items, list) else []
-    main_code = _derive_main_tender_code(po.po_number)
+    # Sub-tender names come from the RM the PO belongs to, never from the PO number
+    # (a PO number like "21064-81" would otherwise become "RM-21064").
+    mt = db.get(MainTender, po.main_tender_id) if po.main_tender_id else None
+    main_code = (mt.tender_code if mt else None) or _normalize_rm_main_tender_code(po.po_number) or _derive_main_tender_code(po.po_number)
 
     plant_id = po.plant_id
     plant_name = po.plant_name
@@ -5648,6 +5678,17 @@ def _apply_pending_action(db: Session, p: PendingIngest) -> dict:
             },
         }
 
+    if doc_type == "purchase_order" and ws_svc.extension_info(p) is not None:
+        # Office orders that only extend a tender's supply period are filed as POs by
+        # the readers. They must never create or overwrite sub-tenders from here.
+        ext = ws_svc.extension_info(p) or {}
+        return {
+            "document_type": "tender_extension",
+            "manual_required": True,
+            "reason": "Time-extension order, not a new PO. Open the RM and use Apply extension.",
+            "extension": ext,
+        }
+
     if doc_type == "purchase_order":
         po_number = str(payload.get("po_number") or payload.get("bill_number") or "").strip()
         po_date_hint = _parse_optional_date(payload.get("po_date") or payload.get("bill_date")) or date.today()
@@ -6205,6 +6246,7 @@ def _main_tender_to_dict(mt: MainTender) -> dict:
         "title": mt.title,
         "notes": mt.notes,
         "is_active": bool(mt.is_active),
+        "status": (getattr(mt, "status", None) or ("active" if mt.is_active else "archived")),
         "created_at": str(mt.created_at) if mt.created_at else None,
     }
 
@@ -6330,6 +6372,101 @@ def list_main_tenders(company_id: Optional[int] = None, db: Session = Depends(ge
         q = q.where(MainTender.company_id == company_id)
     rows = db.execute(q).scalars().all()
     return [_main_tender_to_dict(mt) for mt in rows]
+
+
+# ── Firm -> RM workspace ───────────────────────────────────────────────────
+from services import workspace as ws_svc  # noqa: E402
+
+_po_our_figures = ws_svc.po_our_figures
+_upload_url = ws_svc.upload_url
+
+
+class MainTenderUpdate(BaseModel):
+    status: Optional[str] = None
+    title: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ExtensionApply(BaseModel):
+    new_end_date: date
+    plant_id: Optional[int] = None
+    pending_id: Optional[int] = None
+
+
+@app.get("/api/workspace/rms")
+def workspace_rms(company_id: Optional[int] = None, status: Optional[str] = "active",
+                  q: Optional[str] = None, date_from: Optional[date] = None, date_to: Optional[date] = None,
+                  db: Session = Depends(get_db)):
+    """RM list for one firm (or all), with the numbers each row needs."""
+    return {
+        "rows": ws_svc.list_rms(db, company_id=company_id, status=status, q=q, date_from=date_from, date_to=date_to),
+        "counts": ws_svc.rm_counts(db, company_id=company_id),
+        "inbox_only": ws_svc.inbox_only_rms(db, company_id=company_id),
+    }
+
+
+@app.get("/api/workspace/rms/{mt_id}")
+def workspace_rm(mt_id: int, db: Session = Depends(get_db)):
+    mt = db.get(MainTender, mt_id)
+    if not mt:
+        raise HTTPException(404, "RM not found")
+    return ws_svc.rm_summary(db, mt)
+
+
+@app.get("/api/workspace/rms/{mt_id}/documents")
+def workspace_rm_documents(mt_id: int, include_done: bool = False, db: Session = Depends(get_db)):
+    """Inbox documents that belong to this RM: assigned to it, or the RM is read off the document."""
+    mt = db.get(MainTender, mt_id)
+    if not mt:
+        raise HTTPException(404, "RM not found")
+    return ws_svc.rm_documents(db, mt, include_done=include_done)
+
+
+@app.patch("/api/main-tenders/{mt_id}")
+def update_main_tender(mt_id: int, data: MainTenderUpdate, db: Session = Depends(get_db)):
+    mt = db.get(MainTender, mt_id)
+    if not mt:
+        raise HTTPException(404, "RM not found")
+    if data.title is not None:
+        mt.title = data.title.strip() or None
+    if data.notes is not None:
+        mt.notes = data.notes.strip() or None
+    if data.status is not None:
+        try:
+            ws_svc.set_main_tender_status(db, mt, data.status)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        log.info("RM %s (%s) status set to %s", mt.id, mt.tender_code, mt.status)
+    db.commit()
+    db.refresh(mt)
+    return _main_tender_to_dict(mt)
+
+
+@app.post("/api/main-tenders/{mt_id}/extend")
+def extend_main_tender(mt_id: int, data: ExtensionApply, db: Session = Depends(get_db)):
+    """Apply a time-extension order: move the supply end date of the RM's sub-tenders."""
+    mt = db.get(MainTender, mt_id)
+    if not mt:
+        raise HTTPException(404, "RM not found")
+    changed = ws_svc.apply_extension(db, mt, data.new_end_date, plant_id=data.plant_id)
+    if data.pending_id:
+        p = db.get(PendingIngest, data.pending_id)
+        if p:
+            p.status = IngestStatus.processed
+            p.action_status = "done"
+            p.assigned_company_id = mt.company_id
+            p.assigned_main_tender_id = mt.id
+            note = f"Applied as time extension to {data.new_end_date}"
+            p.review_notes = f"{p.review_notes}; {note}" if p.review_notes else note
+            db.commit()
+    log.info("RM %s extended to %s: %s sub-tenders", mt.tender_code, data.new_end_date, len(changed))
+    return {"changed": changed}
+
+
+@app.get("/api/search")
+def global_search(q: str = "", company_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """One search box for RMs, POs, bills, trucks, unloading rows, broker names and inbox documents."""
+    return ws_svc.search(db, q, company_id=company_id)
 
 
 @app.post("/api/main-tenders")

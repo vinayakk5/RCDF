@@ -152,7 +152,7 @@ class MigrationTests(unittest.TestCase):
             conn.execute(sa.text("INSERT INTO tenders VALUES (1, 1, 1, 1, 1)"))
             conn.execute(sa.text("""INSERT INTO purchase_orders VALUES (1, 1, 1, 1, 1, '[{"material_type": "Maize", "approved_rate_per_qtl": 2650}]')"""))
         ran = migrations.upgrade(engine)
-        self.assertEqual(ran, ["0001", "0002", "0003", "0004"])
+        self.assertEqual(ran, ["0001", "0002", "0003", "0004", "0005"])
         with engine.connect() as conn:
             self.assertTrue(migrations.column_exists(conn, "tenders", "sale_rate_per_qtl"))
             self.assertTrue(migrations.column_exists(conn, "sales_bills", "party_name"))

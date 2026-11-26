@@ -143,6 +143,10 @@ class MainTender(Base):
     title       = Column(String(200))
     notes       = Column(Text)
     is_active   = Column(Boolean, default=True)
+    # active | closed | archived. Closed = work finished, still listed under Closed;
+    # archived = hidden from normal lists. Nothing is ever deleted by a status change.
+    status      = Column(String(20), default="active", index=True)
+    closed_at   = Column(DateTime, nullable=True)
     created_at  = Column(DateTime, default=func.now())
     updated_at  = Column(DateTime, default=func.now(), onupdate=func.now())
 

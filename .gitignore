@@ -87,3 +87,5 @@ old_bridge.js
 Tender_Prep_*/
 **/Tender_Prep_*/**
 **/captcha_images/**
+
+backend/logs/

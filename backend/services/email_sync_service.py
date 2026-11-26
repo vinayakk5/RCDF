@@ -801,8 +801,11 @@ async def sync_email_pending_ingests(
         # Incremental mode uses UID checkpoint and scans only new messages.
         # Fallback mode uses unread/since filters.
         if start_uid and int(start_uid) > 0:
+            # The checkpoint already stops re-reading old mail, so new mail is taken
+            # whether or not someone has opened it on their phone first. (Filtering
+            # UNSEEN here silently lost every PO that was read before the sync ran.)
             search_terms: List[str] = ["UID", f"{int(start_uid) + 1}:*"]
-            if unread_only:
+            if unread_only and _env_flag("EMAIL_SYNC_INCREMENTAL_UNREAD_ONLY", False):
                 search_terms.append("UNSEEN")
         else:
             search_terms = []

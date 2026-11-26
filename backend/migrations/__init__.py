@@ -111,11 +111,55 @@ def m0004_users_and_sessions(conn: Connection) -> None:
     create_model_table(conn, m.UserSession)
 
 
+def m0005_rm_status(conn: Connection) -> None:
+    """RM (main tender) status for active/closed/archived lists, and tender -> PO links."""
+    add_column(conn, "main_tenders", "status", "VARCHAR(20) NULL DEFAULT 'active'")
+    add_column(conn, "main_tenders", "closed_at", "DATETIME NULL")
+    conn.execute(text("UPDATE main_tenders SET status = 'active' WHERE status IS NULL AND (is_active = 1 OR is_active IS NULL)"))
+    conn.execute(text("UPDATE main_tenders SET status = 'archived' WHERE status IS NULL"))
+    _backfill_tender_po_links(conn)
+
+
+def _backfill_tender_po_links(conn: Connection) -> None:
+    """Sub-tenders made before purchase_order_id existed: link them to their PO.
+
+    A PO covers one plant of one RM, so a tender belongs to the PO of the same
+    firm, RM and plant whose lines include the tender's material.
+    """
+    import json
+    import re
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+    pos = conn.execute(text(
+        "SELECT id, company_id, main_tender_id, tender_id, plant_id, line_items FROM purchase_orders"
+    )).fetchall()
+    tenders = conn.execute(text(
+        "SELECT t.id, t.company_id, t.main_tender_id, t.plant_id, m.name FROM tenders t "
+        "JOIN materials m ON m.id = t.material_id WHERE t.purchase_order_id IS NULL"
+    )).fetchall()
+    for tid, cid, mid, plant_id, mat in tenders:
+        match = None
+        for po_id, pcid, pmid, ptid, pplant, lines in pos:
+            if ptid == tid:
+                match = po_id
+                break
+            if pcid != cid or pmid != mid or (pplant and pplant != plant_id):
+                continue
+            try:
+                items = json.loads(lines) if isinstance(lines, str) else (lines or [])
+            except ValueError:
+                items = []
+            if any(norm(i.get("material_type") or i.get("material")) == norm(mat) for i in items if isinstance(i, dict)):
+                match = po_id
+        if match:
+            conn.execute(text("UPDATE tenders SET purchase_order_id = :p WHERE id = :t"), {"p": match, "t": tid})
+
+
 MIGRATIONS: List[Tuple[str, str, Callable[[Connection], None]]] = [
     ("0001", "baseline: create missing tables", m0001_baseline),
     ("0002", "sales bill lines and tender sale rate", m0002_sales_bill_lines),
     ("0003", "auto-approval decisions", m0003_auto_approval),
     ("0004", "users and login sessions", m0004_users_and_sessions),
+    ("0005", "RM status and tender PO links", m0005_rm_status),
 ]
 
 
